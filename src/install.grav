@@ -1,0 +1,23 @@
+// install.grav — what importing apogee-validation turns on: req.validate().
+import "std"
+import "apogee-http"
+import "validator.grav"
+
+namespace apogee {
+
+    class Validation {
+        // Gives Request.validate() its validator (runs once, when the program starts).
+        static fn install() -> bool {
+            Request.validator = fn(req: Request, data: HashMap<string, any>, rules: HashMap<string, any>,
+                                   messages: HashMap<string, string>, attributes: HashMap<string, string>) -> HashMap<string, any> {
+                let v = Validator.make(data, rules, messages, attributes);
+                v.request = req;
+                return v.validate();
+            };
+            return true;
+        }
+    }
+
+    // (set as the program starts: importing this package is enough)
+    let validationInstalled: bool = Validation.install()
+}
