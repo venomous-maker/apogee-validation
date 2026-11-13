@@ -1,0 +1,197 @@
+// messages.grav — MessageBag (the errors of a validation, by field) and the
+// default English messages with their :placeholders.
+import "std"
+
+namespace apogee {
+
+    class MessageBag {
+        private byField: HashMap<string, Array<string>>
+        private order: Array<string>
+        constructor() { self.byField = new HashMap<string, Array<string>>(); self.order = new Array<string>(); }
+
+        fn add(field: string, message: string) -> MessageBag {
+            let list = self.byField.getOr(field, null);
+            if (list == null) { list = new Array<string>(); self.byField.put(field, list); self.order.push(field); }
+            if (!list.contains(message)) { list.push(message); }
+            return self;
+        }
+        // Whether `field` has an error (a `*` pattern matches: "items.*.price").
+        fn has(field: string) -> bool { return self.get(field).size() > 0; }
+        fn hasAny(fields: Array<string>) -> bool { for (f in fields) { if (self.has(f)) { return true; } } return false; }
+        // The first message for `field` (or for any field when ""), or "".
+        fn first(field: string = "") -> string {
+            if (field == "") { return self.order.size() == 0 ? "" : self.byField[self.order[0]][0]; }
+            let all = self.get(field);
+            return all.size() == 0 ? "" : all[0];
+        }
+        fn get(field: string) -> Array<string> {
+            if (Str.indexOf(field, "*") < 0) { return self.byField.getOr(field, new Array<string>()); }
+            let out = new Array<string>();
+            for (f in self.order) { if (MessageBag.matches(field, f)) { for (m in self.byField[f]) { out.push(m); } } }
+            return out;
+        }
+        // Every message, in field order.
+        fn all() -> Array<string> {
+            let out = new Array<string>();
+            for (f in self.order) { for (m in self.byField[f]) { out.push(m); } }
+            return out;
+        }
+        fn fields() -> Array<string> { return self.order; }
+        fn count() -> int { let n = 0; for (f in self.order) { n += self.byField[f].size(); } return n; }
+        fn isEmpty() -> bool { return self.order.size() == 0; }
+        fn isNotEmpty() -> bool { return self.order.size() > 0; }
+        // Field -> its messages (for JSON: {"errors": {...}}).
+        fn toMap() -> HashMap<string, any> {
+            let out = new HashMap<string, any>();
+            for (f in self.order) {
+                let list = new Array<any>();
+                for (m in self.byField[f]) { list.push(m); }
+                out.put(f, list);
+            }
+            return out;
+        }
+        fn merge(other: MessageBag) -> MessageBag {
+            for (f in other.fields()) { for (m in other.get(f)) { self.add(f, m); } }
+            return self;
+        }
+        // "items.*.price" against "items.3.price": `*` stands for one segment.
+        static fn matches(pattern: string, field: string) -> bool {
+            let p = Str.split(pattern, ".");
+            let f = Str.split(field, ".");
+            if (p.size() != f.size()) { return false; }
+            for (i, part in p) { if (part != "*" && part != f[i]) { return false; } }
+            return true;
+        }
+    }
+
+    class Messages {
+        // The default message for `rule`; `kind` picks the size wording:
+        // "numeric", "array", "file" or "string".
+        static fn defaultFor(rule: string, kind: string) -> string {
+            switch (rule) {
+                case "accepted": return "The :attribute field must be accepted."
+                case "accepted_if": return "The :attribute field must be accepted when :other is :value."
+                case "after": return "The :attribute field must be a date after :date."
+                case "after_or_equal": return "The :attribute field must be a date after or equal to :date."
+                case "alpha": return "The :attribute field must only contain letters."
+                case "alpha_dash": return "The :attribute field must only contain letters, numbers, dashes, and underscores."
+                case "alpha_num": return "The :attribute field must only contain letters and numbers."
+                case "array": return "The :attribute field must be an array."
+                case "ascii": return "The :attribute field must only contain single-byte alphanumeric characters and symbols."
+                case "before": return "The :attribute field must be a date before :date."
+                case "before_or_equal": return "The :attribute field must be a date before or equal to :date."
+                case "boolean": return "The :attribute field must be true or false."
+                case "confirmed": return "The :attribute field confirmation does not match."
+                case "contains": return "The :attribute field is missing a required value."
+                case "date": return "The :attribute field must be a valid date."
+                case "date_equals": return "The :attribute field must be a date equal to :date."
+                case "date_format": return "The :attribute field must match the format :format."
+                case "decimal": return "The :attribute field must have :decimal decimal places."
+                case "declined": return "The :attribute field must be declined."
+                case "declined_if": return "The :attribute field must be declined when :other is :value."
+                case "different": return "The :attribute field and :other must be different."
+                case "digits": return "The :attribute field must be :digits digits."
+                case "digits_between": return "The :attribute field must be between :min and :max digits."
+                case "distinct": return "The :attribute field has a duplicate value."
+                case "doesnt_end_with": return "The :attribute field must not end with one of the following: :values."
+                case "doesnt_start_with": return "The :attribute field must not start with one of the following: :values."
+                case "email": return "The :attribute field must be a valid email address."
+                case "ends_with": return "The :attribute field must end with one of the following: :values."
+                case "exists": return "The selected :attribute is invalid."
+                case "extensions": return "The :attribute field must have one of the following extensions: :values."
+                case "file": return "The :attribute field must be a file."
+                case "filled": return "The :attribute field must have a value."
+                case "gt", "gte", "lt", "lte", "max", "min", "between", "size": return Messages.sized(rule, kind)
+                case "hex_color": return "The :attribute field must be a valid hexadecimal color."
+                case "image": return "The :attribute field must be an image."
+                case "in": return "The selected :attribute is invalid."
+                case "in_array": return "The :attribute field must exist in :other."
+                case "integer": return "The :attribute field must be an integer."
+                case "ip": return "The :attribute field must be a valid IP address."
+                case "ipv4": return "The :attribute field must be a valid IPv4 address."
+                case "ipv6": return "The :attribute field must be a valid IPv6 address."
+                case "json": return "The :attribute field must be a valid JSON string."
+                case "list": return "The :attribute field must be a list."
+                case "lowercase": return "The :attribute field must be lowercase."
+                case "mac_address": return "The :attribute field must be a valid MAC address."
+                case "max_digits": return "The :attribute field must not have more than :max digits."
+                case "mimes", "mimetypes": return "The :attribute field must be a file of type: :values."
+                case "min_digits": return "The :attribute field must have at least :min digits."
+                case "missing", "missing_if", "missing_unless", "missing_with": return "The :attribute field must be missing."
+                case "multiple_of": return "The :attribute field must be a multiple of :value."
+                case "not_in": return "The selected :attribute is invalid."
+                case "not_regex": return "The :attribute field format is invalid."
+                case "numeric": return "The :attribute field must be a number."
+                case "password.letters": return "The :attribute field must contain at least one letter."
+                case "password.mixed": return "The :attribute field must contain at least one uppercase and one lowercase letter."
+                case "password.numbers": return "The :attribute field must contain at least one number."
+                case "password.symbols": return "The :attribute field must contain at least one symbol."
+                case "present": return "The :attribute field must be present."
+                case "present_if": return "The :attribute field must be present when :other is :value."
+                case "present_unless": return "The :attribute field must be present unless :other is :value."
+                case "present_with": return "The :attribute field must be present when :values is present."
+                case "present_with_all": return "The :attribute field must be present when :values are present."
+                case "required_if_declined": return "The :attribute field is required when :other is declined."
+                case "prohibited_if_accepted": return "The :attribute field is prohibited when :other is accepted."
+                case "prohibited_if_declined": return "The :attribute field is prohibited when :other is declined."
+                case "missing_with_all": return "The :attribute field must be missing when :values are present."
+                case "doesnt_contain": return "The :attribute field must not contain any of the following: :values."
+                case "dimensions": return "The :attribute field has invalid image dimensions."
+                case "active_url": return "The :attribute field must be a valid URL."
+                case "prohibited": return "The :attribute field is prohibited."
+                case "prohibited_if": return "The :attribute field is prohibited when :other is :value."
+                case "prohibited_unless": return "The :attribute field is prohibited unless :other is in :values."
+                case "prohibits": return "The :attribute field prohibits :other from being present."
+                case "regex": return "The :attribute field format is invalid."
+                case "required": return "The :attribute field is required."
+                case "required_array_keys": return "The :attribute field must contain entries for: :values."
+                case "required_if": return "The :attribute field is required when :other is :value."
+                case "required_if_accepted": return "The :attribute field is required when :other is accepted."
+                case "required_unless": return "The :attribute field is required unless :other is in :values."
+                case "required_with": return "The :attribute field is required when :values is present."
+                case "required_with_all": return "The :attribute field is required when :values are present."
+                case "required_without": return "The :attribute field is required when :values is not present."
+                case "required_without_all": return "The :attribute field is required when none of :values are present."
+                case "same": return "The :attribute field must match :other."
+                case "starts_with": return "The :attribute field must start with one of the following: :values."
+                case "string": return "The :attribute field must be a string."
+                case "timezone": return "The :attribute field must be a valid timezone."
+                case "ulid": return "The :attribute field must be a valid ULID."
+                case "unique": return "The :attribute has already been taken."
+                case "uppercase": return "The :attribute field must be uppercase."
+                case "url": return "The :attribute field must be a valid URL."
+                case "uuid": return "The :attribute field must be a valid UUID."
+                default: return "The :attribute field is invalid."
+            }
+        }
+        private static fn sized(rule: string, kind: string) -> string {
+            let what = kind == "numeric" ? "" : (kind == "array" ? " items" : (kind == "file" ? " kilobytes" : " characters"));
+            let have = kind == "array" ? "have" : (kind == "numeric" ? "be" : "be");
+            switch (rule) {
+                case "min": return kind == "numeric" ? "The :attribute field must be at least :min." : "The :attribute field must " + (kind == "array" ? "have at least :min items." : "be at least :min" + what + ".")
+                case "max": return kind == "numeric" ? "The :attribute field must not be greater than :max." : "The :attribute field must not " + (kind == "array" ? "have more than :max items." : "be greater than :max" + what + ".")
+                case "between": return "The :attribute field must " + (kind == "array" ? "have" : "be") + " between :min and :max" + what + "."
+                case "size": return "The :attribute field must " + (kind == "array" ? "contain :size items." : "be :size" + what + ".")
+                case "gt": return "The :attribute field must " + have + " " + (kind == "array" ? "more than :value items." : "greater than :value" + what + ".")
+                case "gte": return "The :attribute field must " + have + " " + (kind == "array" ? ":value items or more." : "greater than or equal to :value" + what + ".")
+                case "lt": return "The :attribute field must " + have + " " + (kind == "array" ? "less than :value items." : "less than :value" + what + ".")
+                default: return "The :attribute field must " + have + " " + (kind == "array" ? "less than or equal to :value items." : "less than or equal to :value" + what + ".")
+            }
+        }
+        // "first_name" -> "first name"; "items.0.unit_price" -> "items.0.unit price".
+        static fn humanize(field: string) -> string { return Str.replace(field, "_", " "); }
+        // Fills :attribute, :ATTRIBUTE, :Attribute and each of `values`' :keys.
+        static fn fill(template: string, attribute: string, values: HashMap<string, string>) -> string {
+            let out = template;
+            if (Str.indexOf(out, ":") < 0) { return out; }
+            out = Str.replace(out, ":ATTRIBUTE", Str.upper(attribute));
+            out = Str.replace(out, ":Attribute", attribute.length > 0 ? Str.upper(attribute[..1]) + attribute[1..] : attribute);
+            out = Str.replace(out, ":attribute", attribute);
+            // Longer keys first, so ":values" is not eaten by ":value".
+            let keys = values.keys();
+            keys.sortBy(fn(a: string, b: string) -> int { return b.length - a.length; });
+            for (k in keys) { out = Str.replace(out, ":" + k, values[k]); }
+            return out;
+        }
+    }
+}
