@@ -1,0 +1,113 @@
+// form_request.grav — FormRequest: a request that authorizes and validates
+// itself before a controller ever sees it.
+//
+//   class StorePostRequest extends FormRequest {
+//       fn authorize() -> bool { return self.user != null }
+//       fn rules() -> HashMap<string, any> {
+//           return {
+//               "title": "required|string|max:200",
+//               "body": "required|string",
+//               "tags": "array|max:5",
+//               "tags.*": "string|distinct",
+//               "publish_at": "nullable|date|after:now",
+//           }
+//       }
+//       fn messages() -> HashMap<string, string> { return {"title.required": "Every post needs a title."} }
+//       fn attributes() -> HashMap<string, string> { return {"publish_at": "publication date"} }
+//       fn prepareForValidation() { self.merge({"slug": Str.lower(self.string("title"))}) }
+//   }
+//
+//   class PostController extends Controller {
+//       fn store(req: StorePostRequest) -> Response {     // authorized and valid, or never called
+//           let post = Post.create(req.validated())
+//           return Response.created(post)
+//       }
+//   }
+//
+// The container builds it with the request it stands for (its constructor
+// is inherited: subclasses need none), and the router has every
+// ValidatesWhenResolved validated as it is made: authorize() false is a 403,
+// failed rules a ValidationException (422 JSON, or a redirect back with errors
+// and old input).
+import "std"
+import "apogee-http"
+import "validator.grav"
+import "messages.grav"
+
+namespace apogee {
+
+    @FormRequest abstract class FormRequest extends Request implements ValidatesWhenResolved {
+        private checker: Validator
+        private done: bool
+
+        // (The request it stands for; the container passes it.)
+        constructor(req: Request) {
+            super(req.http);
+            self.adopt(req);
+            self.checker = null;
+            self.done = false;
+        }
+
+        // ── what a subclass says ───────────────────────────────────────────────
+        // Whether the user may make this request at all (false: 403).
+        fn authorize() -> bool { return true; }
+        abstract fn rules() -> HashMap<string, any>
+        // Messages by "field.rule" (or "rule"; "items.*.qty.min" for wildcards).
+        fn messages() -> HashMap<string, string> { return new HashMap<string, string>(); }
+        // Display names by field ("publish_at" -> "publication date").
+        fn attributes() -> HashMap<string, string> { return new HashMap<string, string>(); }
+        // The data validated (the whole input, by default).
+        fn validationData() -> HashMap<string, any> { return self.all(); }
+        // Stop at the first failing field.
+        fn stopOnFirstFailure() -> bool { return false; }
+        // Where a failed form goes back to ("" for the page it came from).
+        fn redirectTo() -> string { return ""; }
+        // The session's name for this form's errors (several forms on one page).
+        fn errorBag() -> string { return "default"; }
+
+        // ── the lifecycle's hooks ──────────────────────────────────────────────
+        // Before anything: tidy the input (merge(), replace()).
+        fn prepareForValidation() {}
+        // Change the validator before it runs (v.sometimes(...), v.after(...)).
+        fn withValidator(v: Validator) {}
+        // Checks that need the rules' results (add errors with v.addError).
+        fn after(v: Validator) {}
+        // Once valid (normalize what validated() gives).
+        fn passedValidation() {}
+        fn failedAuthorization() { throw new HttpException(403, "This action is unauthorized."); }
+        fn failedValidation(v: Validator) {
+            let e = new ValidationException(v);
+            e.redirectTo = self.redirectTo();
+            e.errorBag = self.errorBag();
+            throw e;
+        }
+
+        // ── the lifecycle ──────────────────────────────────────────────────────
+        fn validateResolved() {
+            if (self.done) { return; }
+            self.done = true;
+            self.prepareForValidation();
+            if (!self.authorize()) { self.failedAuthorization(); }
+            let v = Validator.make(self.validationData(), self.rules(), self.messages(), self.attributes());
+            v.request = self;
+            v.stopOnFirstFailure = self.stopOnFirstFailure();
+            let me = self;
+            v.after(fn(x: Validator) { me.after(x); });
+            self.withValidator(v);
+            if (v.fails()) { self.failedValidation(v); }
+            self.checker = v;
+            self.set("apogee.validated", v.validated());
+            self.passedValidation();
+        }
+        fn validator() -> Validator {
+            if (!self.done) { self.validateResolved(); }
+            return self.checker;
+        }
+        // What passed validation (only fields that have rules).
+        fn validated() -> HashMap<string, any> { return self.validator().validated(); }
+        // The same, with only/except/merge.
+        fn safe() -> ValidatedInput { return self.validator().safe(); }
+        // One validated value (a dotted path), or `fallback`.
+        fn validatedInput(key: string, fallback: any = null) -> any { return self.safe().input(key, fallback); }
+    }
+}
