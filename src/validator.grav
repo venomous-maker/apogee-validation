@@ -1,0 +1,856 @@
+// validator.grav — Validator: data against rules, with errors worth showing.
+//
+//   let v = Validator.make(req.all(), {
+//       "email": "required|email|max:255",
+//       "age": "nullable|integer|between:18,120",
+//       "items": "required|array|min:1",
+//       "items.*.sku": "required|distinct",
+//       "items.*.qty": "required|integer|gte:1",
+//       "password": ["required", "confirmed", Password.min(12).mixedCase()],
+//   })
+//   if (v.fails()) { return Response.json(v.errors().toMap(), 422) }
+//   let data = v.validated()
+//
+// A field's rules are a "rule|rule:param,param" string, or a list of rule
+// strings, built rules (Rule.*), rule objects (ValidationRule) and closures.
+// Rules other than the implicit ones (required*, present, accepted, filled,
+// prohibited*, missing*, ...) skip a field that is missing or blank;
+// `nullable` lets null through, `sometimes` skips a missing field entirely,
+// `bail` stops at the field's first failure, `exclude*` leaves it out of the
+// validated data. A field path may use `*` for each element ("items.*.qty").
+import "std"
+import "std/net"
+import "apogee-http"
+import "messages.grav"
+import "rules.grav"
+
+namespace apogee {
+
+    // One rule, parsed once.
+    class ParsedRule {
+        public name: string
+        public params: Array<string>
+        public spec: RuleSpec
+        public obj: ValidationRule
+        constructor(name: string, params: Array<string>) { self.name = name; self.params = params; self.spec = null; self.obj = null; }
+    }
+
+    // A field's parsed rules and the flags among them.
+    class FieldRules {
+        public rules: Array<ParsedRule>
+        public bail: bool = false
+        public nullable: bool = false
+        public sometimes: bool = false
+        public numeric: bool = false
+        public array: bool = false
+        constructor() { self.rules = new Array<ParsedRule>(); }
+    }
+
+    // Validated data: only, except, merge, typed reads.
+    class ValidatedInput {
+        public data: HashMap<string, any>
+        constructor(data: HashMap<string, any>) { self.data = data; }
+        fn all() -> HashMap<string, any> { return self.data; }
+        fn has(key: string) -> bool { return Plain.dig(self.data, key) != null || self.data.containsKey(key); }
+        fn input(key: string, fallback: any = null) -> any { let v = Plain.dig(self.data, key); return v == null ? fallback : v; }
+        fn only(keys: Array<string>) -> HashMap<string, any> {
+            let out = new HashMap<string, any>();
+            for (k in keys) { if (self.data.containsKey(k)) { out.put(k, self.data[k]); } }
+            return out;
+        }
+        fn except(keys: Array<string>) -> HashMap<string, any> {
+            let out = new HashMap<string, any>();
+            self.data.forEach(fn(k: string, v: any) { if (!keys.contains(k)) { out.put(k, v); } });
+            return out;
+        }
+        // The data with `values` added (for saving: validated fields plus a user id, say).
+        fn merge(values: HashMap<string, any>) -> HashMap<string, any> {
+            let out = new HashMap<string, any>();
+            self.data.forEach(fn(k: string, v: any) { out.put(k, v); });
+            values.forEach(fn(k: string, v: any) { out.put(k, v); });
+            return out;
+        }
+        fn keys() -> Array<string> { let k = self.data.keys(); Sort.sort(k); return k; }
+    }
+
+    // What failed validation: the errors, rendered as a 422 for a JSON client,
+    // or a redirect back (with the errors and old input flashed) for a form.
+    class ValidationException extends Exception implements Renderable {
+        public validator: Validator
+        public status: int = 422
+        // Where a form goes back to ("" for the page it came from).
+        public redirectTo: string = ""
+        // The errors' name in the session (several forms on one page).
+        public errorBag: string = "default"
+        // Inputs never flashed back to a form.
+        public static dontFlash: Array<string> = ["password", "password_confirmation", "current_password"]
+        constructor(v: Validator) { super(ValidationException.summary(v.errors())); self.validator = v; }
+        public fn kind() -> string { return "ValidationException"; }
+        fn errors() -> MessageBag { return self.validator.errors(); }
+        static fn summary(errors: MessageBag) -> string {
+            let first = errors.first();
+            let more = errors.count() - 1;
+            if (more <= 0) { return first == "" ? "The given data was invalid." : first; }
+            return first + " (and ${more} more error" + (more == 1 ? ")" : "s)");
+        }
+        fn render(req: Request) -> Response {
+            if (req.expectsJson()) {
+                let body = new HashMap<string, any>();
+                body.put("message", self.message());
+                body.put("errors", self.errors().toMap());
+                return Response.json(body, self.status);
+            }
+            if (req.session is FlashStore) {
+                let bags = new HashMap<string, any>();
+                bags.put(self.errorBag, self.errors().toMap());
+                (req.session as FlashStore).flash("errors", bags);
+                req.flashExcept(ValidationException.dontFlash);
+                return self.redirectTo != "" ? Response.redirect(self.redirectTo) : Response.back(req);
+            }
+            let items = new StringBuilder();
+            for (m in self.errors().all()) { items.append("<li>").append(HttpException.escape(m)).append("</li>"); }
+            return Response.html(Str.replace(HttpException.page(422, "The given data was invalid."), "</main>", "<ul>" + items.toString() + "</ul></main>"), 422);
+        }
+    }
+
+    class Validator {
+        public data: HashMap<string, any>
+        public request: Request
+        // Stop validating every field at the first failure anywhere.
+        public stopOnFirstFailure: bool = false
+        // How unique/exists rules ask the database.
+        public static presence: PresenceVerifier = null
+        private rawRules: HashMap<string, any>
+        private custom: HashMap<string, string>
+        private names: HashMap<string, string>
+        private bag: MessageBag
+        private excluded: HashSet<string>
+        private hooks: Array<fn(Validator)>
+        private ran: bool
+        // Rules added by name: Validator.extend("even", fn, message).
+        private static extensions: HashMap<string, fn(string, any, Array<string>, Validator) -> bool> = new HashMap<string, fn(string, any, Array<string>, Validator) -> bool>()
+        private static extensionMessages: HashMap<string, string> = new HashMap<string, string>()
+
+        constructor(data: HashMap<string, any>, rules: HashMap<string, any>, messages: HashMap<string, string>, attributes: HashMap<string, string>) {
+            self.data = data; self.rawRules = rules; self.custom = messages; self.names = attributes;
+            self.request = null; self.bag = new MessageBag(); self.excluded = new HashSet<string>();
+            self.hooks = new Array<fn(Validator)>(); self.ran = false;
+        }
+        static fn make(data: HashMap<string, any>, rules: HashMap<string, any>,
+                       messages: HashMap<string, string> = new HashMap<string, string>(),
+                       attributes: HashMap<string, string> = new HashMap<string, string>()) -> Validator {
+            return new Validator(data, rules, messages, attributes);
+        }
+        // A rule of your own, usable by name in rule strings ("even", "even:strict").
+        static fn extend(name: string, check: fn(string, any, Array<string>, Validator) -> bool, message: string) {
+            Validator.extensions.put(name, check);
+            Validator.extensionMessages.put(name, message);
+        }
+
+        // ── running ────────────────────────────────────────────────────────────
+        fn passes() -> bool { self.run(); return self.bag.isEmpty(); }
+        fn fails() -> bool { return !self.passes(); }
+        fn errors() -> MessageBag { self.run(); return self.bag; }
+        // The validated data, or a ValidationException.
+        fn validate() -> HashMap<string, any> {
+            if (self.fails()) { throw new ValidationException(self); }
+            return self.validated();
+        }
+        // `f` runs after the rules (add errors with addError).
+        fn after(f: fn(Validator)) -> Validator { self.hooks.push(f); return self; }
+        // Adds `rules` to `field` when `condition(data)` holds (checked when validation runs).
+        fn sometimes(field: string, rules: any, condition: fn(HashMap<string, any>) -> bool) -> Validator {
+            if (condition(self.data)) {
+                let existing = self.rawRules.getOr(field, null);
+                let list = new Array<any>();
+                if (existing != null) { for (r in Validator.ruleItems(existing)) { list.push(r); } }
+                for (r in Validator.ruleItems(rules)) { list.push(r); }
+                self.rawRules.put(field, list);
+            }
+            return self;
+        }
+        fn addError(field: string, message: string) { self.bag.add(field, Messages.fill(message, self.attributeName(field), new HashMap<string, string>())); }
+
+        private fn run() {
+            if (self.ran) { return; }
+            self.ran = true;
+            let patterns = self.rawRules.keys();
+            Sort.sort(patterns);
+            for (pattern in patterns) {
+                let fr = self.parse(self.rawRules[pattern]);
+                for (field in self.expand(pattern)) {
+                    self.validateField(pattern, field, fr);
+                    if (self.stopOnFirstFailure && self.bag.isNotEmpty()) { break; }
+                }
+                if (self.stopOnFirstFailure && self.bag.isNotEmpty()) { break; }
+            }
+            for (h in self.hooks) { h(self); }
+        }
+
+        // The validated data: each ruled field that is present and not
+        // excluded (a nested path keeps its nesting; a wildcard field's whole
+        // top-level value is kept).
+        fn validated() -> HashMap<string, any> {
+            self.run();
+            let out = new HashMap<string, any>();
+            let patterns = self.rawRules.keys();
+            Sort.sort(patterns);
+            for (pattern in patterns) {
+                if (Str.indexOf(pattern, "*") >= 0) {
+                    let top = Str.split(pattern, ".")[0];
+                    if (self.data.containsKey(top) && !self.excluded.contains(top)) { out.put(top, self.data[top]); }
+                    continue;
+                }
+                if (self.excluded.contains(pattern) || !self.present(pattern)) { continue; }
+                if (Str.indexOf(pattern, ".") >= 0) { Plain.setPath(out, pattern, self.value(pattern)); } else { out.put(pattern, self.value(pattern)); }
+            }
+            return out;
+        }
+        fn safe() -> ValidatedInput { return new ValidatedInput(self.validated()); }
+
+        // ── parsing ────────────────────────────────────────────────────────────
+        static fn ruleItems(rules: any) -> Array<any> {
+            let out = new Array<any>();
+            if (rules is string) {
+                let s = rules as string;
+                // A regex may hold "|": keep "regex:..." and what follows whole.
+                let at = Str.indexOf(s, "regex:");
+                if (at >= 0) {
+                    let before = s[..at];
+                    for (p in Str.split(before, "|")) { if (Str.trim(p) != "") { out.push(Str.trim(p)); } }
+                    out.push(s[at..]);
+                    return out;
+                }
+                for (p in Str.split(s, "|")) { if (Str.trim(p) != "") { out.push(Str.trim(p)); } }
+            } else if (rules is Array<any>) {
+                for (x in rules as Array<any>) {
+                    if (x is ConditionalRules) {
+                        let c = x as ConditionalRules;
+                        for (y in Validator.ruleItems(c.condition ? c.whenTrue as any : c.whenFalse as any)) { out.push(y); }
+                    } else if (x is string) {
+                        for (y in Validator.ruleItems(x)) { out.push(y); }
+                    } else { out.push(x); }
+                }
+            } else if (rules is Array<string>) {
+                for (x in rules as Array<string>) { for (y in Validator.ruleItems(x)) { out.push(y); } }
+            } else if (rules != null) {
+                out.push(rules);
+            }
+            return out;
+        }
+        private fn parse(rules: any) -> FieldRules {
+            let fr = new FieldRules();
+            for (item in Validator.ruleItems(rules)) {
+                let p: ParsedRule = null;
+                if (item is string) {
+                    let s = item as string;
+                    let colon = Str.indexOf(s, ":");
+                    let name = Str.lower(colon >= 0 ? s[..colon] : s);
+                    let params = new Array<string>();
+                    if (colon >= 0) {
+                        let rest = s[colon + 1..];
+                        if (name == "regex" || name == "not_regex" || name == "date_format") { params.push(rest); }
+                        else { for (x in Str.split(rest, ",")) { params.push(Str.trim(x)); } }
+                    }
+                    p = new ParsedRule(name, params);
+                } else if (item is RuleSpec) {
+                    let spec = item as RuleSpec;
+                    p = new ParsedRule(spec.name, spec.params);
+                    p.spec = spec;
+                } else if (item is ValidationRule) {
+                    p = new ParsedRule("object", new Array<string>());
+                    p.obj = item as ValidationRule;
+                } else {
+                    throw new ValueError("not a rule: " + str(item));
+                }
+                switch (p.name) {
+                    case "bail": fr.bail = true
+                    case "nullable": fr.nullable = true
+                    case "sometimes": fr.sometimes = true
+                    case "numeric", "integer", "decimal": { fr.numeric = true; fr.rules.push(p); }
+                    case "array", "list": { fr.array = true; fr.rules.push(p); }
+                    default: fr.rules.push(p)
+                }
+            }
+            return fr;
+        }
+        // The concrete fields a pattern names ("items.*.qty" -> "items.0.qty", ...).
+        private fn expand(pattern: string) -> Array<string> {
+            let out = new Array<string>();
+            if (Str.indexOf(pattern, "*") < 0) { out.push(pattern); return out; }
+            self.walk(self.data as any, Str.split(pattern, "."), 0, "", out);
+            return out;
+        }
+        private fn walk(cur: any, parts: Array<string>, i: int, prefix: string, out: Array<string>) {
+            if (i == parts.size()) { out.push(prefix); return; }
+            let part = parts[i];
+            let join = fn(p: string, k: string) -> string { return p == "" ? k : p + "." + k; };
+            if (part != "*") {
+                let next = Plain.dig(cur, part);
+                // A missing leaf still gets validated (required fails on it).
+                if (next == null && i < parts.size() - 1) { return; }
+                self.walk(next, parts, i + 1, join(prefix, part), out);
+                return;
+            }
+            if (cur is Array<any>) {
+                for (idx, x in cur as Array<any>) { self.walk(x, parts, i + 1, join(prefix, "${idx}"), out); }
+            } else if (cur is HashMap<string, any>) {
+                let keys = (cur as HashMap<string, any>).keys();
+                Sort.sort(keys);
+                for (k in keys) { self.walk((cur as HashMap<string, any>)[k], parts, i + 1, join(prefix, k), out); }
+            }
+        }
+
+        // ── one field ──────────────────────────────────────────────────────────
+        fn present(field: string) -> bool {
+            if (self.data.containsKey(field)) { return true; }
+            let dot = Str.lastIndexOf(field, ".");
+            if (dot < 0) { return false; }
+            let parent = Plain.dig(self.data, field[..dot]);
+            let leaf = field[dot + 1..];
+            if (parent is HashMap<string, any>) { return (parent as HashMap<string, any>).containsKey(leaf); }
+            if (parent is Array<any>) { let i = Format.toIntOr(leaf, -1); return i >= 0 && i < (parent as Array<any>).size(); }
+            return false;
+        }
+        fn value(field: string) -> any {
+            if (self.data.containsKey(field)) { return self.data[field]; }
+            let v = Plain.dig(self.data, field);
+            if (v == null && self.request != null && Str.indexOf(field, ".") < 0) { let f = self.request.file(field); if (f != null) { return f; } }
+            return v;
+        }
+        static fn blank(v: any) -> bool {
+            if (v == null) { return true; }
+            if (v is string) { return Str.trim(v as string) == ""; }
+            if (v is Array<any>) { return (v as Array<any>).size() == 0; }
+            if (v is HashMap<string, any>) { return (v as HashMap<string, any>).size() == 0; }
+            return false;
+        }
+        private fn validateField(pattern: string, field: string, fr: FieldRules) {
+            let value = self.value(field);
+            let isPresent = self.present(field) || value != null;
+            // exclude* first: an excluded field is neither validated nor returned.
+            for (r in fr.rules) {
+                if (Str.startsWith(r.name, "exclude") && self.excludes(r, field, value)) { self.excluded.add(field); return; }
+            }
+            if (fr.sometimes && !isPresent) { return; }
+            let kind = fr.numeric ? "numeric" : (fr.array || value is Array<any> ? "array" : (value is UploadedFile ? "file" : "string"));
+            for (r in fr.rules) {
+                if (Str.startsWith(r.name, "exclude")) { continue; }
+                let implicit = Validator.isImplicit(r);
+                if (!implicit) {
+                    if (!isPresent) { continue; }
+                    if (value == null && fr.nullable) { continue; }
+                    if (value is string && Str.trim(value as string) == "") { continue; }
+                }
+                let failures = new Array<string>();
+                if (r.obj != null) {
+                    if (r.obj is DataAwareRule) { (r.obj as DataAwareRule).setData(self.data); }
+                    r.obj.validate(self.attributeName(field), value, fn(m: string) { failures.push(m); });
+                } else if (!self.check(r, field, value, kind)) {
+                    failures.push(self.messageFor(pattern, field, r, kind));
+                }
+                for (m in failures) { self.bag.add(field, Messages.fill(m, self.attributeName(field), new HashMap<string, string>())); }
+                if (failures.size() > 0 && (fr.bail || self.stopOnFirstFailure)) { return; }
+                // A field that is not of the right type does not get its size rules checked against nonsense.
+                if (failures.size() > 0 && (r.name == "numeric" || r.name == "integer" || r.name == "array" || r.name == "string")) { return; }
+            }
+        }
+        static fn isImplicit(r: ParsedRule) -> bool {
+            if (r.obj != null) { return r.obj.implicit(); }
+            let n = r.name;
+            return Str.startsWith(n, "required") || Str.startsWith(n, "prohibited") || Str.startsWith(n, "missing") ||
+                   Str.startsWith(n, "accepted") || Str.startsWith(n, "declined") || n == "present" || n == "filled" || n == "prohibits";
+        }
+        private fn excludes(r: ParsedRule, field: string, value: any) -> bool {
+            switch (r.name) {
+                case "exclude": return true
+                case "exclude_if": return self.otherIs(r.params)
+                case "exclude_unless": return !self.otherIs(r.params)
+                case "exclude_with": return self.anyPresent(r.params)
+                case "exclude_without": return !self.anyPresent(r.params)
+                case "exclude_if_fn": return r.spec.condition()
+                default: return false
+            }
+        }
+
+        // ── the rules ──────────────────────────────────────────────────────────
+        private fn check(r: ParsedRule, field: string, v: any, kind: string) -> bool {
+            let p = r.params;
+            switch (r.name) {
+                // presence
+                case "required": return !Validator.blank(v)
+                case "required_if": return !self.otherIs(p) || !Validator.blank(v)
+                case "required_unless": return self.otherIs(p) || !Validator.blank(v)
+                case "required_if_accepted": return !Validator.isAccepted(self.value(p[0])) || !Validator.blank(v)
+                case "required_with": return !self.anyPresent(p) || !Validator.blank(v)
+                case "required_with_all": return !self.allPresent(p) || !Validator.blank(v)
+                case "required_without": return self.allPresent(p) || !Validator.blank(v)
+                case "required_without_all": return self.anyPresent(p) || !Validator.blank(v)
+                case "required_if_fn": return !r.spec.condition() || !Validator.blank(v)
+                case "required_array_keys": {
+                    if (!(v is HashMap<string, any>)) { return false; }
+                    for (k in p) { if (!(v as HashMap<string, any>).containsKey(k)) { return false; } }
+                    return true;
+                }
+                case "present": return self.present(field)
+                case "present_if": return !self.otherIs(p) || self.present(field)
+                case "present_unless": return self.otherIs(p) || self.present(field)
+                case "present_with": return !self.anyPresent(p) || self.present(field)
+                case "present_with_all": return !self.allPresent(p) || self.present(field)
+                case "required_if_declined": return !Validator.isDeclined(self.value(p[0])) || !Validator.blank(v)
+                case "prohibited_if_accepted": return !Validator.isAccepted(self.value(p[0])) || Validator.blank(v)
+                case "prohibited_if_declined": return !Validator.isDeclined(self.value(p[0])) || Validator.blank(v)
+                case "missing_with_all": return !self.allPresent(p) || !self.present(field)
+                case "filled": return !self.present(field) || !Validator.blank(v)
+                case "missing": return !self.present(field)
+                case "missing_if": return !self.otherIs(p) || !self.present(field)
+                case "missing_unless": return self.otherIs(p) || !self.present(field)
+                case "missing_with": return !self.anyPresent(p) || !self.present(field)
+                case "prohibited": return Validator.blank(v)
+                case "prohibited_if": return !self.otherIs(p) || Validator.blank(v)
+                case "prohibited_unless": return self.otherIs(p) || Validator.blank(v)
+                case "prohibited_if_fn": return !r.spec.condition() || Validator.blank(v)
+                case "prohibits": return Validator.blank(v) || !self.anyFilled(p)
+                case "accepted": return Validator.isAccepted(v)
+                case "accepted_if": return !self.otherIs(p) || Validator.isAccepted(v)
+                case "declined": return Validator.isDeclined(v)
+                case "declined_if": return !self.otherIs(p) || Validator.isDeclined(v)
+                // types
+                case "string": return v is string
+                case "integer": return Validator.isInteger(v)
+                case "numeric": return Validator.isNumeric(v)
+                case "decimal": return Validator.decimalPlaces(v, p)
+                case "boolean": return v is bool || (v is long && ((v as long) == 0 || (v as long) == 1)) || (v is string && Validator.listed(Str.lower(v as string), "0,1,true,false"))
+                case "array": {
+                    if (v is Array<any>) { return true; }
+                    if (!(v is HashMap<string, any>)) { return false; }
+                    if (p.size() == 0) { return true; }
+                    for (k in (v as HashMap<string, any>).keys()) { if (!p.contains(k)) { return false; } }
+                    return true;
+                }
+                case "list": return v is Array<any>
+                case "json": { if (!(v is string)) { return false; } try { Json.parse(v as string); return true; } catch (e: Exception) { return false; } }
+                case "date": return Validator.dateOf(v) != null
+                case "date_format": { if (!(v is string)) { return false; } try { DateTime.parse(v as string, Validator.strftime(p[0])); return true; } catch (e: Exception) { return false; } }
+                case "email": return v is string && Validator.isEmail(v as string)
+                case "url": return v is string && Validator.isUrl(v as string, p)
+                case "ip": return v is string && IpAddress.isValid(v as string)
+                case "ipv4": return v is string && IpAddress.isValid(v as string) && IpAddress.parse(v as string).isV4()
+                case "ipv6": return v is string && IpAddress.isValid(v as string) && IpAddress.parse(v as string).isV6()
+                case "mac_address": return v is string && Validator.isMac(v as string)
+                case "uuid": return v is string && Uuid.isValid(v as string)
+                case "ulid": return v is string && Validator.isUlid(v as string)
+                case "alpha": return v is string && Validator.allBytes(v as string, 1)
+                case "alpha_num": return Validator.textOf(v) != "" && Validator.allBytes(Validator.textOf(v), 2)
+                case "alpha_dash": return Validator.textOf(v) != "" && Validator.allBytes(Validator.textOf(v), 3)
+                case "ascii": return v is string && Validator.allBytes(v as string, 4)
+                case "lowercase": return v is string && Str.lower(v as string) == v as string
+                case "uppercase": return v is string && Str.upper(v as string) == v as string
+                case "hex_color": return v is string && Validator.isHexColor(v as string)
+                case "timezone": return v is string && Validator.isTimezone(v as string)
+                case "regex": return v is string && Validator.regexOf(p[0]).test(v as string)
+                case "not_regex": return v is string && !Validator.regexOf(p[0]).test(v as string)
+                // sizes
+                case "min": return self.sizeOf(v, kind) >= Validator.num(p, 0)
+                case "max": return self.sizeOf(v, kind) <= Validator.num(p, 0)
+                case "between": return self.sizeOf(v, kind) >= Validator.num(p, 0) && self.sizeOf(v, kind) <= Validator.num(p, 1)
+                case "size": return self.sizeOf(v, kind) == Validator.num(p, 0)
+                case "gt": return self.sizeOf(v, kind) > self.otherSize(p[0], kind)
+                case "gte": return self.sizeOf(v, kind) >= self.otherSize(p[0], kind)
+                case "lt": return self.sizeOf(v, kind) < self.otherSize(p[0], kind)
+                case "lte": return self.sizeOf(v, kind) <= self.otherSize(p[0], kind)
+                case "digits": { let t = Validator.textOf(v); return Validator.allBytes(t, 5) && t.length == Validator.num(p, 0) as int; }
+                case "digits_between": { let t = Validator.textOf(v); return Validator.allBytes(t, 5) && t.length >= Validator.num(p, 0) as int && t.length <= Validator.num(p, 1) as int; }
+                case "min_digits": { let t = Validator.textOf(v); return Validator.allBytes(t, 5) && t.length >= Validator.num(p, 0) as int; }
+                case "max_digits": { let t = Validator.textOf(v); return Validator.allBytes(t, 5) && t.length <= Validator.num(p, 0) as int; }
+                case "multiple_of": {
+                    if (!Validator.isNumeric(v)) { return false; }
+                    let d = Validator.num(p, 0);
+                    if (d == 0.0) { return false; }
+                    let q = Validator.toNumber(v) / d;
+                    return Math.abs(q - Math.round(q)) < 0.0000001;
+                }
+                // comparing
+                case "in": return p.contains(Validator.textOf(v)) || (v is Array<any> && Validator.allIn(v as Array<any>, p))
+                case "not_in": return !p.contains(Validator.textOf(v))
+                case "same": return Validator.textOf(v) == Validator.textOf(self.value(p[0]))
+                case "different": return Validator.textOf(v) != Validator.textOf(self.value(p[0]))
+                case "confirmed": {
+                    let other = p.size() > 0 && p[0] != "" ? p[0] : field + "_confirmation";
+                    return self.present(other) && Validator.textOf(v) == Validator.textOf(self.value(other));
+                }
+                case "starts_with": { let t = Validator.textOf(v); for (x in p) { if (Str.startsWith(t, x)) { return true; } } return false; }
+                case "ends_with": { let t = Validator.textOf(v); for (x in p) { if (Str.endsWith(t, x)) { return true; } } return false; }
+                case "doesnt_start_with": { let t = Validator.textOf(v); for (x in p) { if (Str.startsWith(t, x)) { return false; } } return true; }
+                case "doesnt_end_with": { let t = Validator.textOf(v); for (x in p) { if (Str.endsWith(t, x)) { return false; } } return true; }
+                case "doesnt_contain": { if (!(v is Array<any>)) { return true; } let have = Validator.textsOf(v as Array<any>); for (x in p) { if (have.contains(x)) { return false; } } return true; }
+                case "contains": { if (!(v is Array<any>)) { return false; } for (x in p) { if (!Validator.textsOf(v as Array<any>).contains(x)) { return false; } } return true; }
+                case "distinct": return self.isDistinct(field, v, p)
+                case "in_array": return Validator.textsOf(Plain.digAll(self.data, p[0])).contains(Validator.textOf(v))
+                // dates
+                case "after": return self.compareDate(v, p[0], 1, false)
+                case "after_or_equal": return self.compareDate(v, p[0], 1, true)
+                case "before": return self.compareDate(v, p[0], -1, false)
+                case "before_or_equal": return self.compareDate(v, p[0], -1, true)
+                case "date_equals": return self.compareDate(v, p[0], 0, true)
+                // files
+                case "file": return v is UploadedFile
+                case "image": return v is UploadedFile && Validator.listed((v as UploadedFile).extension(), "jpg,jpeg,png,gif,bmp,svg,webp")
+                case "mimes", "extensions": {
+                    if (!(v is UploadedFile)) { return false; }
+                    let ext = (v as UploadedFile).extension();
+                    return p.contains(ext) || (ext == "jpeg" && p.contains("jpg")) || (ext == "jpg" && p.contains("jpeg"));
+                }
+                case "mimetypes": return v is UploadedFile && Validator.mimeMatches(p, (v as UploadedFile).mimeType())
+                case "dimensions": return v is UploadedFile && Validator.dimensionsFit((v as UploadedFile).bytes(), p)
+                case "active_url": {
+                    if (!(v is string) || !Validator.isUrl(v as string, new Array<string>())) { return false; }
+                    try { return Net.resolve(Url.parse(v as string).host).size() > 0; } catch (e: Exception) { return false; }
+                }
+                // the database
+                case "unique": return self.countRows(r, field, v) == 0
+                case "exists": return self.countRows(r, field, v) > 0
+                default: {
+                    let ext = Validator.extensions.getOr(r.name, null);
+                    if (ext == null) { throw new ValueError("unknown validation rule '" + r.name + "' (on " + field + ")"); }
+                    return ext(field, v, p, self);
+                }
+            }
+        }
+
+        // ── helpers for the rules ──────────────────────────────────────────────
+        // Whether the field p[0] has one of the values p[1..] ("null" matches a missing/null one).
+        private fn otherIs(p: Array<string>) -> bool {
+            if (p.size() == 0) { return false; }
+            let other = self.value(p[0]);
+            let text = other == null ? "null" : Validator.textOf(other);
+            if (other is bool) { text = (other as bool) ? "true" : "false"; }
+            for (i in 1..p.size()) { if (p[i] == text) { return true; } }
+            return false;
+        }
+        private fn anyPresent(fields: Array<string>) -> bool { for (f in fields) { if (!Validator.blank(self.value(f))) { return true; } } return false; }
+        private fn allPresent(fields: Array<string>) -> bool { for (f in fields) { if (Validator.blank(self.value(f))) { return false; } } return true; }
+        private fn anyFilled(fields: Array<string>) -> bool { return self.anyPresent(fields); }
+        static fn isAccepted(v: any) -> bool {
+            if (v is bool) { return v as bool; }
+            if (v is long) { return (v as long) == 1; }
+            return v is string && Validator.listed(Str.lower(v as string), "yes,on,1,true");
+        }
+        static fn isDeclined(v: any) -> bool {
+            if (v is bool) { return !(v as bool); }
+            if (v is long) { return (v as long) == 0; }
+            return v is string && Validator.listed(Str.lower(v as string), "no,off,0,false");
+        }
+        static fn isInteger(v: any) -> bool {
+            if (v is long || v is int) { return true; }
+            if (v is double) { let d = v as double; return d == Math.floor(d); }
+            if (!(v is string)) { return false; }
+            let s = Str.trim(v as string);
+            let start = Str.startsWith(s, "-") || Str.startsWith(s, "+") ? 1 : 0;
+            return s.length > start && Validator.allBytes(s[start..], 5);
+        }
+        static fn isNumeric(v: any) -> bool {
+            if (v is long || v is int || v is double) { return true; }
+            if (!(v is string)) { return false; }
+            let s = Str.trim(v as string);
+            if (s == "") { return false; }
+            let i = 0;
+            if (s[0] as int == 45 || s[0] as int == 43) { i = 1; }
+            let digits = 0;
+            let dots = 0;
+            let exp = false;
+            while (i < s.length) {
+                let c = s[i] as int;
+                if (c >= 48 && c <= 57) { digits += 1; }
+                else if (c == 46 && !exp) { dots += 1; if (dots > 1) { return false; } }
+                else if ((c == 101 || c == 69) && digits > 0 && !exp) {
+                    exp = true;
+                    if (i + 1 < s.length && (s[i + 1] as int == 45 || s[i + 1] as int == 43)) { i += 1; }
+                    if (i + 1 >= s.length) { return false; }
+                } else { return false; }
+                i += 1;
+            }
+            return digits > 0;
+        }
+        static fn toNumber(v: any) -> double {
+            if (v is double) { return v as double; }
+            if (v is long) { return (v as long) as double; }
+            if (v is int) { return (v as int) as double; }
+            return Format.toFloatOr(Str.trim(Validator.textOf(v)), 0.0);
+        }
+        private static fn decimalPlaces(v: any, p: Array<string>) -> bool {
+            if (!Validator.isNumeric(v)) { return false; }
+            let t = Validator.textOf(v);
+            let dot = Str.indexOf(t, ".");
+            let places = dot < 0 ? 0 : t.length - dot - 1;
+            let lo = Validator.num(p, 0) as int;
+            let hi = p.size() > 1 ? Validator.num(p, 1) as int : lo;
+            return places >= lo && places <= hi;
+        }
+        private fn sizeOf(v: any, kind: string) -> double {
+            if (kind == "numeric" && Validator.isNumeric(v)) { return Validator.toNumber(v); }
+            if (v is Array<any>) { return (v as Array<any>).size() as double; }
+            if (v is HashMap<string, any>) { return (v as HashMap<string, any>).size() as double; }
+            if (v is UploadedFile) { return ((v as UploadedFile).size() as double) / 1024.0; }
+            if (v is long || v is double) { return Validator.toNumber(v); }
+            return Utf8.count(Validator.textOf(v)) as double;
+        }
+        // gt/gte/lt/lte compare with another field, or a number.
+        private fn otherSize(param: string, kind: string) -> double {
+            if (self.present(param)) { return self.sizeOf(self.value(param), kind); }
+            return Format.toFloatOr(param, 0.0);
+        }
+        // Whether `s` is one of the comma-separated `list`.
+        static fn listed(s: string, list: string) -> bool { return !Str.contains(s, ",") && Str.contains("," + list + ",", "," + s + ","); }
+        static fn num(p: Array<string>, i: int) -> double { return i < p.size() ? Format.toFloatOr(p[i], 0.0) : 0.0; }
+        static fn textOf(v: any) -> string {
+            if (v == null) { return ""; }
+            if (v is string) { return v as string; }
+            if (v is bool) { return (v as bool) ? "1" : "0"; }
+            return str(v);
+        }
+        static fn textsOf(vs: Array<any>) -> Array<string> { let out = new Array<string>(); for (x in vs) { out.push(Validator.textOf(x)); } return out; }
+        private static fn allIn(vs: Array<any>, allowed: Array<string>) -> bool { for (x in vs) { if (!allowed.contains(Validator.textOf(x))) { return false; } } return true; }
+        // 1 letters, 2 letters+digits, 3 letters+digits+-_, 4 ASCII, 5 digits.
+        static fn allBytes(s: string, kind: int) -> bool {
+            if (s == "") { return false; }
+            for (i in 0..s.length) {
+                let c = s[i] as int;
+                let letter = (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c >= 128;
+                let digit = c >= 48 && c <= 57;
+                let ok = false;
+                switch (kind) {
+                    case 1: ok = letter
+                    case 2: ok = letter || digit
+                    case 3: ok = letter || digit || c == 45 || c == 95
+                    case 4: ok = c < 128
+                    default: ok = digit
+                }
+                if (!ok) { return false; }
+            }
+            return true;
+        }
+        static fn isEmail(s: string) -> bool {
+            let at = Str.lastIndexOf(s, "@");
+            if (at < 1 || at != Str.indexOf(s, "@") || at == s.length - 1 || s.length > 254) { return false; }
+            let local = s[..at];
+            let domain = s[at + 1..];
+            if (local.length > 64 || Str.startsWith(local, ".") || Str.endsWith(local, ".") || Str.contains(local, "..")) { return false; }
+            if (!Str.contains(domain, ".") || Str.startsWith(domain, ".") || Str.endsWith(domain, ".") || Str.contains(domain, "..")) { return false; }
+            for (i in 0..s.length) { let c = s[i] as int; if (c <= 32 || c == 34 || c == 40 || c == 41 || c == 44 || c == 58 || c == 59 || c == 60 || c == 62 || c == 91 || c == 92 || c == 93) { return false; } }
+            for (label in Str.split(domain, ".")) { if (label == "" || Str.startsWith(label, "-") || Str.endsWith(label, "-")) { return false; } }
+            return true;
+        }
+        static fn isUrl(s: string, schemes: Array<string>) -> bool {
+            let sep = Str.indexOf(s, "://");
+            if (sep <= 0 || !Url.isValid(s)) { return false; }
+            let scheme = Str.lower(s[..sep]);
+            if (schemes.size() > 0) { return schemes.contains(scheme); }
+            return Validator.listed(scheme, "http,https,ftp,ftps,ws,wss") && s.length > sep + 3;
+        }
+        static fn isMac(s: string) -> bool {
+            let parts = Str.split(Str.replace(s, "-", ":"), ":");
+            if (parts.size() != 6) { return false; }
+            for (p in parts) { if (p.length != 2 || !Validator.isHex(p)) { return false; } }
+            return true;
+        }
+        static fn isHex(s: string) -> bool {
+            for (i in 0..s.length) { let c = s[i] as int; if (!((c >= 48 && c <= 57) || (c >= 97 && c <= 102) || (c >= 65 && c <= 70))) { return false; } }
+            return s != "";
+        }
+        static fn isHexColor(s: string) -> bool {
+            if (!Str.startsWith(s, "#")) { return false; }
+            let n = s.length - 1;
+            return (n == 3 || n == 4 || n == 6 || n == 8) && Validator.isHex(s[1..]);
+        }
+        static fn isUlid(s: string) -> bool {
+            if (s.length != 26 || (s[0] as int) > 55) { return false; }
+            for (i in 0..26) {
+                let c = Str.upper(s)[i] as int;
+                let ok = (c >= 48 && c <= 57) || (c >= 65 && c <= 90 && c != 73 && c != 76 && c != 79 && c != 85);
+                if (!ok) { return false; }
+            }
+            return true;
+        }
+        static fn isTimezone(s: string) -> bool {
+            if (s == "UTC" || s == "GMT") { return true; }
+            if (Str.contains(s, "..") || !Str.contains(s, "/")) { return false; }
+            return new File("/usr/share/zoneinfo/" + s).exists();
+        }
+        // "/^[a-z]+$/i" -> a Regex (the delimiters stripped, `i` honoured).
+        static fn regexOf(pattern: string) -> Regex {
+            if (pattern.length >= 2 && Str.startsWith(pattern, "/")) {
+                let end = Str.lastIndexOf(pattern, "/");
+                if (end > 0) { return new Regex(pattern[1..end], Str.contains(pattern[end + 1..], "i")); }
+            }
+            return new Regex(pattern);
+        }
+        // "Y-m-d H:i:s" (PHP style) -> "%Y-%m-%d %H:%M:%S"; a format with % is kept.
+        static fn strftime(format: string) -> string {
+            if (Str.contains(format, "%")) { return format; }
+            let sb = new StringBuilder();
+            for (i in 0..format.length) {
+                let c = format[i..i + 1];
+                switch (c) {
+                    case "Y": sb.append("%Y")
+                    case "y": sb.append("%y")
+                    case "m": sb.append("%m")
+                    case "d": sb.append("%d")
+                    case "H": sb.append("%H")
+                    case "i": sb.append("%M")
+                    case "s": sb.append("%S")
+                    case "D": sb.append("%a")
+                    case "M": sb.append("%b")
+                    default: sb.append(c)
+                }
+            }
+            return sb.toString();
+        }
+        static fn dateOf(v: any) -> DateTime {
+            if (v is DateTime) { return v as DateTime; }
+            if (!(v is string)) { return null; }
+            return DateTime.tryParse(Str.trim(v as string));
+        }
+        // `param` is another field's name, "today"/"tomorrow"/"yesterday"/"now", or a date.
+        private fn dateParam(param: string) -> DateTime {
+            switch (param) {
+                case "now": return DateTime.now()
+                case "today": { let n = DateTime.now(); return DateTime.of(n.year(), n.month(), n.day()); }
+                case "tomorrow": { let n = DateTime.now().addDays(1); return DateTime.of(n.year(), n.month(), n.day()); }
+                case "yesterday": { let n = DateTime.now().addDays(-1); return DateTime.of(n.year(), n.month(), n.day()); }
+                default: return self.present(param) ? Validator.dateOf(self.value(param)) : DateTime.tryParse(param)
+            }
+        }
+        // direction 1: after, -1: before, 0: equal.
+        private fn compareDate(v: any, param: string, direction: int, orEqual: bool) -> bool {
+            let a = Validator.dateOf(v);
+            let b = self.dateParam(param);
+            if (a == null || b == null) { return false; }
+            let d = a.unix() - b.unix();
+            if (direction == 0) { return d == 0; }
+            if (d == 0) { return orEqual; }
+            return direction > 0 ? d > 0 : d < 0;
+        }
+        private fn isDistinct(field: string, v: any, p: Array<string>) -> bool {
+            // The sibling fields: the same path with each index replaced by "*".
+            let parts = Str.split(field, ".");
+            let pattern = new Array<string>();
+            for (x in parts) { pattern.push(Format.toIntOr(x, -1) >= 0 ? "*" : x); }
+            let ignoreCase = p.contains("ignore_case");
+            let mine = ignoreCase ? Str.lower(Validator.textOf(v)) : Validator.textOf(v);
+            let count = 0;
+            for (x in Plain.digAll(self.data, Str.join(pattern, "."))) {
+                let t = ignoreCase ? Str.lower(Validator.textOf(x)) : Validator.textOf(x);
+                if (t == mine) { count += 1; }
+            }
+            return count <= 1;
+        }
+        // width=, height=, min_width=, max_width=, min_height=, max_height=, ratio=3/2 (or 1.5).
+        static fn dimensionsFit(data: Bytes, p: Array<string>) -> bool {
+            let size = ImageSize.of(data);
+            if (size.size() != 2) { return false; }
+            let w = size[0];
+            let h = size[1];
+            for (c in p) {
+                let eq = Str.indexOf(c, "=");
+                if (eq < 0) { continue; }
+                let k = Str.trim(c[..eq]);
+                let val = Str.trim(c[eq + 1..]);
+                let n = Format.toIntOr(val, -1);
+                switch (k) {
+                    case "width": if (w != n) { return false; }
+                    case "height": if (h != n) { return false; }
+                    case "min_width": if (w < n) { return false; }
+                    case "max_width": if (w > n) { return false; }
+                    case "min_height": if (h < n) { return false; }
+                    case "max_height": if (h > n) { return false; }
+                    case "ratio": {
+                        let slash = Str.indexOf(val, "/");
+                        let want = slash > 0 ? Format.toFloatOr(val[..slash], 1.0) / Format.toFloatOr(val[slash + 1..], 1.0) : Format.toFloatOr(val, 1.0);
+                        if (h == 0 || Math.abs((w as double) / (h as double) - want) > 0.0001) { return false; }
+                    }
+                    default: {}
+                }
+            }
+            return true;
+        }
+        static fn mimeMatches(patterns: Array<string>, mime: string) -> bool {
+            let m = Str.lower(mime);
+            for (p in patterns) {
+                if (p == m || p == "*/*") { return true; }
+                if (Str.endsWith(p, "/*") && Str.startsWith(m, p[..p.length - 1])) { return true; }
+            }
+            return false;
+        }
+        private fn countRows(r: ParsedRule, field: string, v: any) -> long {
+            if (Validator.presence == null) { throw new StateError("unique/exists rules need Validator.presence (the framework sets it for Orbit)"); }
+            let table = r.params.size() > 0 ? r.params[0] : "";
+            let column = r.params.size() > 1 && r.params[1] != "" ? r.params[1] : Str.split(field, ".")[Str.split(field, ".").size() - 1];
+            let excludeId = r.spec != null ? r.spec.ignoreId : (r.params.size() > 2 && r.params[2] != "NULL" ? r.params[2] : "");
+            let idColumn = r.spec != null ? r.spec.idColumn : (r.params.size() > 3 ? r.params[3] : "id");
+            let wheres = r.spec != null ? r.spec.wheres : new HashMap<string, any>();
+            return Validator.presence.count(table, column, v, excludeId, idColumn, wheres);
+        }
+
+        // ── messages ───────────────────────────────────────────────────────────
+        // The field's display name: a custom attribute (by field or by pattern), else words.
+        fn attributeName(field: string) -> string {
+            if (self.names.containsKey(field)) { return self.names[field]; }
+            for (k in self.names.keys()) { if (Str.contains(k, "*") && MessageBag.matches(k, field)) { return self.names[k]; } }
+            return Messages.humanize(field);
+        }
+        private fn messageFor(pattern: string, field: string, r: ParsedRule, kind: string) -> string {
+            let template = "";
+            let keyed = [field + "." + r.name, pattern + "." + r.name];
+            for (k in keyed) { if (template == "" && self.custom.containsKey(k)) { template = self.custom[k]; } }
+            if (template == "") {
+                for (k in self.custom.keys()) {
+                    if (Str.contains(k, "*") && Str.endsWith(k, "." + r.name) && MessageBag.matches(k[..k.length - r.name.length - 1], field)) { template = self.custom[k]; }
+                }
+            }
+            if (template == "" && self.custom.containsKey(r.name)) { template = self.custom[r.name]; }
+            if (template == "") { template = Validator.extensionMessages.getOr(r.name, Messages.defaultFor(r.name, kind)); }
+            return Messages.fill(template, self.attributeName(field), self.placeholders(r));
+        }
+        private fn placeholders(r: ParsedRule) -> HashMap<string, string> {
+            let m = new HashMap<string, string>();
+            let p = r.params;
+            let first = p.size() > 0 ? p[0] : "";
+            switch (r.name) {
+                case "min", "min_digits": m.put("min", first)
+                case "max", "max_digits": m.put("max", first)
+                case "between", "digits_between": { m.put("min", first); m.put("max", p.size() > 1 ? p[1] : ""); }
+                case "size": m.put("size", first)
+                case "digits": m.put("digits", first)
+                case "decimal": m.put("decimal", p.size() > 1 ? first + "-" + p[1] : first)
+                case "multiple_of": m.put("value", first)
+                case "gt", "gte", "lt", "lte": m.put("value", self.present(first) ? self.attributeName(first) : first)
+                case "same", "different", "in_array": m.put("other", self.attributeName(first))
+                case "after", "after_or_equal", "before", "before_or_equal", "date_equals": m.put("date", self.present(first) ? self.attributeName(first) : first)
+                case "date_format": m.put("format", first)
+                case "required_if", "required_unless", "prohibited_if", "prohibited_unless", "accepted_if", "declined_if", "missing_if", "missing_unless": {
+                    m.put("other", self.attributeName(first));
+                    let rest = new Array<string>();
+                    for (i in 1..p.size()) { rest.push(p[i]); }
+                    m.put("value", rest.size() > 0 ? rest[0] : "");
+                    m.put("values", Str.join(rest, ", "));
+                }
+                case "required_if_accepted", "required_if_declined", "prohibited_if_accepted", "prohibited_if_declined": m.put("other", self.attributeName(first))
+                case "present_if", "present_unless": { m.put("other", self.attributeName(first)); m.put("value", p.size() > 1 ? p[1] : ""); }
+                case "present_with", "present_with_all", "missing_with_all": {
+                    let names = new Array<string>();
+                    for (x in p) { names.push(self.attributeName(x)); }
+                    m.put("values", Str.join(names, " / "));
+                }
+                case "required_with", "required_with_all", "required_without", "required_without_all", "prohibits", "missing_with": {
+                    let names = new Array<string>();
+                    for (x in p) { names.push(self.attributeName(x)); }
+                    m.put("values", Str.join(names, " / "));
+                    m.put("other", Str.join(names, ", "));
+                }
+                default: m.put("values", Str.join(p, ", "))
+            }
+            return m;
+        }
+    }
+}
