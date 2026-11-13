@@ -1,0 +1,244 @@
+// apogee-validation's tests: the rules by family, wildcards and validated
+// data, conditional rules, formats, messages and attribute names, custom rules,
+// the database rules, files, rendering, req.validate(), and form requests end
+// to end through the router.
+import "std"
+import "std/net"
+import "../src/all.grav"
+import "../../apogee-routing/src/all.grav"
+use apogee.*
+
+fn check(data: HashMap<string, any>, rules: HashMap<string, any>) -> MessageBag { return Validator.make(data, rules).errors() }
+fn json(text: string) -> HashMap<string, any> { return Plain.parse(text) as HashMap<string, any> }
+
+test "presence, types and sizes, with Laravel's messages" {
+    let e = check(json("{\"name\": \"\", \"age\": \"17\", \"bio\": \"abcdef\", \"tags\": [1, 2, 3], \"score\": \"x\", \"ok\": \"yes\"}"), {
+        "name": "required", "email": "required|email", "age": "integer|min:18", "bio": "string|max:5",
+        "tags": "array|between:1,2", "score": "numeric|max:10", "ok": "boolean", "nick": "nullable|string|min:3",
+    })
+    assertEq(e.first("name"), "The name field is required.")
+    assertEq(e.first("email"), "The email field is required.")
+    assertEq(e.first("age"), "The age field must be at least 18.")
+    assertEq(e.first("bio"), "The bio field must not be greater than 5 characters.")
+    assertEq(e.first("tags"), "The tags field must have between 1 and 2 items.")
+    assertEq(e.get("score").size(), 1)                                   // not numeric: its max is not checked
+    assertEq(e.first("ok"), "The ok field must be true or false.")
+    assertEq(e.has("nick"), false)                                       // missing and not required
+    assertEq(check(json("{\"nick\": null}"), {"nick": "nullable|string|min:3"}).isEmpty(), true)
+    assertEq(check(json("{\"nick\": null}"), {"nick": "string"}).first("nick"), "The nick field must be a string.")
+    assertEq(check(json("{\"p\": \"a\", \"p_confirmation\": \"b\"}"), {"p": "confirmed"}).first("p"), "The p field confirmation does not match.")
+    assertEq(check(json("{\"x\": \"a\"}"), {"x": "bail|integer|min:5"}).get("x").size(), 1)
+    assertEq(check(json("{}"), {"x": "sometimes|required"}).isEmpty(), true)
+}
+
+test "wildcards, distinct, in_array, exclusion, and the validated data" {
+    let data = json("{\"items\": [{\"sku\": \"a\", \"qty\": 2}, {\"sku\": \"a\", \"qty\": 0}, {\"qty\": 1}], \"favorite\": \"b\", \"note\": \"x\", \"draft\": true}")
+    let v = Validator.make(data, {
+        "items": "required|array", "items.*.sku": "required|distinct", "items.*.qty": "integer|gte:1",
+        "favorite": "in_array:items.*.sku", "note": "exclude_if:draft,true|string", "draft": "boolean",
+    })
+    let e = v.errors()
+    assertEq(e.first("items.1.sku"), "The items.1.sku field has a duplicate value.")
+    assertEq(e.first("items.2.sku"), "The items.2.sku field is required.")
+    assertEq(e.first("items.1.qty"), "The items.1.qty field must be greater than or equal to 1.")
+    assertEq(e.get("items.*.sku").size(), 3)
+    assertEq(e.first("favorite"), "The favorite field must exist in items.*.sku.")
+    let ok = Validator.make(json("{\"items\": [{\"sku\": \"a\"}], \"note\": \"x\", \"draft\": true, \"extra\": 1, \"user\": {\"name\": \"Ada\", \"pw\": \"s\"}}"),
+                            {"items.*.sku": "required", "note": "exclude_if:draft,true", "draft": "boolean", "user.name": "required"})
+    let d = ok.validate()
+    assertEq("${d.containsKey("items")} ${d.containsKey("note")} ${d.containsKey("extra")} ${(d["user"] as HashMap<string, any>).containsKey("pw")}", "true false false false")
+    assertEq(ok.safe().only(["draft"]).size(), 1)
+}
+
+test "conditional rules" {
+    let r: HashMap<string, any> = {"reason": "required_if:status,rejected,cancelled", "phone": "required_without:email", "email": "required_without:phone",
+             "coupon": "prohibited_unless:plan,pro", "terms": "accepted_if:signup,true", "vat": "required_with:company",
+             "card": "prohibits:invoice", "nick": "missing_if:anonymous,true", "id": "present"}
+    let e = check(json("{\"status\": \"rejected\", \"plan\": \"free\", \"coupon\": \"X\", \"signup\": true, \"company\": \"Acme\", \"card\": \"4242\", \"invoice\": \"yes\", \"anonymous\": true, \"nick\": \"n\"}"), r)
+    assertEq(e.first("reason"), "The reason field is required when status is rejected.")
+    assertEq(e.first("phone"), "The phone field is required when email is not present.")
+    assertEq(e.first("coupon"), "The coupon field is prohibited unless plan is in pro.")
+    assertEq(e.first("terms"), "The terms field must be accepted when signup is true.")
+    assertEq(e.first("vat"), "The vat field is required when company is present.")
+    assertEq(e.first("card"), "The card field prohibits invoice from being present.")
+    assertEq(e.first("nick"), "The nick field must be missing.")
+    assertEq(e.first("id"), "The id field must be present.")
+    assertEq(check(json("{\"status\": \"ok\", \"email\": \"a@b.co\", \"id\": null}"), r).isEmpty(), true)
+    let flag = true
+    assertEq(check(json("{}"), {"x": [Rule.requiredIf(fn() -> bool { return flag })]}).has("x"), true)
+    assertEq(check(json("{}"), {"x": [Rule.when(false, ["required"], ["nullable"])]}).isEmpty(), true)
+}
+
+test "formats: emails, URLs, addresses, ids, dates, patterns, digits" {
+    let good = json("{\"e\": \"ada@example.co.uk\", \"u\": \"https://grav.dev/docs?x=1\", \"ip4\": \"10.0.0.1\", \"ip6\": \"::1\", \"id\": \"3f2b9c1e-8d4a-4f6b-9a2e-7c1d5e8f0a3b\", \"ul\": \"01ARZ3NDEKTSV4RRFFQ69G5FAV\", \"j\": \"[1,2]\", \"d\": \"2026-11-14\", \"df\": \"14/11/2026\", \"start\": \"2026-01-01\", \"end\": \"2026-02-01\", \"code\": \"AB|12\", \"slug\": \"a-b_c\", \"pin\": \"0123\", \"price\": \"9.99\", \"n\": 15, \"color\": \"#ff00aa\", \"mac\": \"00:1A:2b:3c:4D:5e\", \"low\": \"abc\", \"tz\": \"Africa/Nairobi\"}")
+    let rules = {"e": "email", "u": "url", "ip4": "ipv4", "ip6": "ipv6", "id": "uuid", "ul": "ulid", "j": "json", "d": "date",
+                 "df": "date_format:d/m/Y", "end": "date|after:start", "start": "before:end|after_or_equal:2026-01-01",
+                 "code": "regex:/^[A-Z]{2}\\|[0-9]+$/", "slug": "alpha_dash", "pin": "digits:4", "price": "decimal:2", "n": "multiple_of:5",
+                 "color": "hex_color", "mac": "mac_address", "low": "lowercase", "tz": "timezone"} as HashMap<string, any>
+    let ge = check(good, rules)
+    assertEq(Str.join(ge.all(), " | "), "")
+    let bad = json("{\"e\": \"ada@@x\", \"u\": \"javascript:alert(1)\", \"ip4\": \"::1\", \"ip6\": \"10.0.0.1\", \"id\": \"nope\", \"ul\": \"ILOU\", \"j\": \"{\", \"d\": \"soon\", \"df\": \"2026-11-14\", \"start\": \"2026-03-01\", \"end\": \"2026-02-01\", \"code\": \"ab|12\", \"slug\": \"a b\", \"pin\": \"12a4\", \"price\": \"9.9\", \"n\": 16, \"color\": \"red\", \"mac\": \"00:1A\", \"low\": \"Abc\", \"tz\": \"Mars/Base\"}")
+    let be = check(bad, rules)
+    assertEq(be.fields().size(), 20)
+    assertEq(be.first("end"), "The end field must be a date after start.")
+    assertEq(be.first("df"), "The df field must match the format d/m/Y.")
+}
+
+class EvenRule implements ValidationRule {
+    fn validate(attribute: string, value: any, fail: fn(string)) { if ((value as long) % 2 != 0) { fail("The :attribute must be even.") } }
+    fn implicit() -> bool { return false }
+}
+
+test "messages, attribute names, custom rules, extensions, after hooks" {
+    Validator.extend("palindrome", fn(field: string, v: any, p: Array<string>, val: Validator) -> bool {
+        let s = Validator.textOf(v)
+        let rev = new StringBuilder()
+        let i = s.length - 1
+        while (i >= 0) { rev.appendChar(s[i] as int); i -= 1 }
+        return rev.toString() == s
+    }, "The :attribute must read the same both ways.")
+    let v = Validator.make(json("{\"first_name\": \"\", \"items\": [{\"qty\": 0}], \"word\": \"grav\", \"n\": 3, \"role\": \"root\", \"pw\": \"short\", \"slug\": \"a--b\"}"), {
+        "first_name": "required", "items.*.qty": "min:1", "word": "palindrome", "n": [new EvenRule()], "role": [Rule.in(["admin", "user"])],
+        "pw": [Password.min(8).mixedCase().numbers()],
+        "slug": [Rule.check(fn(attr: string, value: any, fail: fn(string)) { if (Str.contains(value as string, "--")) { fail("The :attribute must not contain \"--\".") } })],
+    }, {"first_name.required": "Tell us your :attribute!", "items.*.qty.min": "Each :attribute needs at least :min."}, {"items.*.qty": "quantity"})
+    v.after(fn(x: Validator) { if (x.data.containsKey("word")) { x.addError("word", "Also, :attribute is reserved.") } })
+    let e = v.errors()
+    assertEq(e.first("first_name"), "Tell us your first name!")
+    assertEq(e.first("items.0.qty"), "Each quantity needs at least 1.")
+    assertEq(Str.join(e.get("word"), " "), "The word must read the same both ways. Also, word is reserved.")
+    assertEq(e.first("n"), "The n must be even.")
+    assertEq(e.first("role"), "The selected role is invalid.")
+    assertEq(Str.join(e.get("pw"), " "), "The pw field must be at least 8 characters. The pw field must contain at least one uppercase and one lowercase letter. The pw field must contain at least one number.")
+    assertEq(e.first("slug"), "The slug must not contain \"--\".")
+    assertEq(check(json("{\"v\": \"12\"}"), {"v": [Rule.anyOf(["email", "integer"])]}).isEmpty(), true)
+    assertEq(check(json("{\"v\": \"x\"}"), {"v": [Rule.anyOf(["email", "integer"])]}).has("v"), true)
+    let msg = ""
+    try { check(json("{\"v\": 1}"), {"v": "nosuchrule"}) } catch (e2: ValueError) { msg = e2.message() }
+    assertEq(msg, "unknown validation rule 'nosuchrule' (on v)")
+}
+
+class FakeTable implements PresenceVerifier {
+    public rows: Array<HashMap<string, any>> = new Array<HashMap<string, any>>()
+    fn count(table: string, column: string, value: any, excludeId: string, idColumn: string, wheres: HashMap<string, any>) -> long {
+        let n: long = 0
+        for (r in self.rows) {
+            if (Validator.textOf(r[column]) != Validator.textOf(value)) { continue }
+            if (excludeId != "" && Validator.textOf(r[idColumn]) == excludeId) { continue }
+            let misses = new Array<string>()
+            wheres.forEach(fn(k: string, w: any) { if (Validator.textOf(r[k]) != Validator.textOf(w)) { misses.push(k) } })
+            if (misses.size() == 0) { n += 1 }
+        }
+        return n
+    }
+}
+
+test "unique and exists through the presence verifier" {
+    let t = new FakeTable()
+    t.rows.push(json("{\"id\": 1, \"email\": \"ada@x.io\", \"team\": 1}"))
+    t.rows.push(json("{\"id\": 2, \"email\": \"bob@x.io\", \"team\": 2}"))
+    Validator.presence = t
+    let taken = json("{\"email\": \"ada@x.io\"}")
+    assertEq(check(taken, {"email": "unique:users"}).first("email"), "The email has already been taken.")
+    assertEq(check(taken, {"email": [Rule.unique("users").ignore(1)]}).isEmpty(), true)       // updating Ada herself
+    assertEq(check(taken, {"email": [Rule.unique("users").where("team", 2)]}).isEmpty(), true)
+    assertEq(check(json("{\"owner\": \"bob@x.io\"}"), {"owner": "exists:users,email"}).isEmpty(), true)
+    assertEq(check(json("{\"owner\": \"eve@x.io\"}"), {"owner": "exists:users,email"}).first("owner"), "The selected owner is invalid.")
+    Validator.presence = null
+}
+
+fn png(w: int, h: int) -> Bytes {
+    let b = new Bytes()
+    for (x in [137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82]) { b.appendByte(x) }
+    for (x in [(w >> 24) & 255, (w >> 16) & 255, (w >> 8) & 255, w & 255, (h >> 24) & 255, (h >> 16) & 255, (h >> 8) & 255, h & 255]) { b.appendByte(x) }
+    return b
+}
+
+test "files: types, sizes, image dimensions" {
+    let fd = new FormData()
+    fd.addFile("avatar", "me.png", "image/png", png(400, 300))
+    fd.addFile("doc", "cv.exe", "application/octet-stream", Bytes.fromString(Str.repeat("x", 3000)))
+    let req = Request.make("POST", "/u")
+    req.http.headers.set("Content-Type", fd.contentType())
+    req.http.bodyBytes = fd.body()
+    let v = Validator.make(req.all(), {
+        "avatar": "required|image|mimes:png,jpg|dimensions:min_width=300,max_height=300,ratio=4/3",
+        "doc": "file|mimes:pdf|max:2", "photo": "required|file", "pic": [FileRule.image().maxKilobytes(1)],
+    })
+    v.request = req
+    let e = v.errors()
+    assertEq(e.has("avatar"), false)
+    assertEq(Str.join(e.get("doc"), " "), "The doc field must be a file of type: pdf. The doc field must not be greater than 2 kilobytes.")
+    assertEq(e.first("photo"), "The photo field is required.")
+    let wide = Validator.make(req.all(), {"avatar": "dimensions:max_width=200"})
+    wide.request = req
+    assertEq(wide.errors().first("avatar"), "The avatar field has invalid image dimensions.")
+    assertEq(Str.join(Validator.textsOf([400 as any, 300 as any]), "x"), "400x300")
+    let size = ImageSize.of(png(1920, 1080))
+    assertEq("${size[0]}x${size[1]}", "1920x1080")
+}
+
+class Flash implements FlashStore, OldInputStore {
+    public values: HashMap<string, any> = new HashMap<string, any>()
+    public old: HashMap<string, any> = new HashMap<string, any>()
+    fn flash(key: string, value: any) { self.values.put(key, value) }
+    fn flashed(key: string) -> any { return self.values.getOr(key, null) }
+    fn oldInput(key: string) -> any { return self.old.getOr(key, null) }
+    fn flashInput(values: HashMap<string, any>) { self.old = values }
+}
+
+test "ValidationException renders 422 JSON, or redirects back with errors and old input" {
+    let api = Request.make("POST", "/x", "{\"email\": \"no\"}", "application/json")
+    let status = 0
+    let body = ""
+    try { api.validate({"email": "required|email", "name": "required"}) }
+    catch (e: ValidationException) { let r = e.render(api); status = r.statusCode(); body = r.body() }
+    assertEq(status, 422)
+    let out = Plain.parse(body) as HashMap<string, any>
+    assertEq(out["message"] as string, "The email field must be a valid email address. (and 1 more error)")
+    assertEq(((out["errors"] as HashMap<string, any>)["name"] as Array<any>)[0] as string, "The name field is required.")
+
+    let form = Request.make("POST", "/signup", "email=x&password=secret", "application/x-www-form-urlencoded")
+    form.http.headers.set("Referer", "/signup")
+    let store = new Flash()
+    form.session = store
+    let res: Response = null
+    try { form.validate({"email": "email"}) } catch (e: ValidationException) { res = e.render(form) }
+    assertEq("${res.statusCode()} ${res.getHeader("Location")}", "302 /signup")
+    assertEq((store.flashed("errors") as HashMap<string, any>).containsKey("default"), true)
+    assertEq("${store.old["email"]} ${store.old.containsKey("password")}", "x false")
+    assertEq(Request.make("POST", "/", "a=1", "application/x-www-form-urlencoded").validate({"a": "integer"})["a"] as string, "1")
+}
+
+class StorePost extends FormRequest {
+    fn authorize() -> bool { return self.header("X-Role") != "guest" }
+    fn rules() -> HashMap<string, any> { return {"title": "required|string|max:20", "slug": "required|alpha_dash", "tags": "array", "tags.*": "distinct"} }
+    fn messages() -> HashMap<string, string> { return {"title.required": "Every post needs a title."} }
+    fn prepareForValidation() { if (self.filled("title")) { self.merge({"slug": Str.replace(Str.lower(self.string("title")), " ", "-") as any}) } }
+    fn after(v: Validator) { if (self.string("title") == "Forbidden") { v.addError("title", "That :attribute is not allowed.") } }
+}
+class PostController extends Controller {
+    constructor() {}
+    fn store(req: StorePost) -> Response { return Response.created(req.validated()) }
+}
+
+test "form requests: authorize, validate, prepare, after hooks, then the controller" {
+    let r = new Router(new Container())
+    r.post::<PostController>("/posts", "store")
+    let k = new HttpKernel(r)
+    let send = fn(body: string, role: string) -> Response {
+        let q = Request.make("POST", "/posts", body, "application/json")
+        q.http.headers.set("Accept", "application/json")
+        if (role != "") { q.http.headers.set("X-Role", role) }
+        return k.handleRequest(q)
+    }
+    let made = send("{\"title\": \"Hello World\", \"extra\": 1}", "")
+    let body = made.data() as HashMap<string, any>
+    assertEq("${made.statusCode()} ${body["slug"]} ${body["title"]} ${body.containsKey("extra")}", "201 hello-world Hello World false")
+    assertEq(send("{\"title\": \"Hello\"}", "guest").statusCode(), 403)
+    let bad = send("{\"tags\": [\"a\", \"a\"]}", "")
+    let errs = (bad.data() as HashMap<string, any>)["errors"] as HashMap<string, any>
+    assertEq("${bad.statusCode()} ${(errs["title"] as Array<any>)[0]} ${errs.containsKey("tags.1")}", "422 Every post needs a title. true")
+    let hooked = send("{\"title\": \"Forbidden\"}", "")
+    assertEq(((hooked.data() as HashMap<string, any>)["errors"] as HashMap<string, any>).containsKey("title"), true)
+}
