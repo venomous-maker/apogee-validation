@@ -1,0 +1,242 @@
+// rules.grav — rules beyond the "name:params" strings: built ones (Rule.in,
+// Rule.unique(...).ignore(id), Rule.requiredIf(fn), Password.min(8).mixedCase()),
+// rule objects of your own, and closures.
+//
+//   "email": ["required", "email", Rule.unique("users", "email").ignore(user.id)]
+//   "role":  ["required", Rule.in(["admin", "editor", "viewer"])]
+//   "password": ["required", "confirmed", Password.min(12).mixedCase().numbers().symbols()]
+//   "slug": ["required", Rule.check(fn(attr: string, value: any, fail: fn(string)) {
+//       if (Str.contains(value as string, "--")) { fail("The :attribute must not contain \"--\".") }
+//   })]
+import "std"
+import "apogee-http"
+import "messages.grav"
+import "validator.grav"
+
+namespace apogee {
+
+    // A rule object: call `fail` with a message (":attribute" is filled in)
+    // when the value does not pass.
+    interface ValidationRule {
+        fn validate(attribute: string, value: any, fail: fn(string))
+        // Whether it runs even when the field is missing or empty (as required does).
+        fn implicit() -> bool { return false; }
+    }
+
+    // A rule object that sees all the data being validated (set before it runs).
+    interface DataAwareRule {
+        fn setData(data: HashMap<string, any>)
+    }
+
+    // How unique/exists rules ask the database (set Validator.presence; the
+    // framework wires it to Orbit): how many rows of `table` have `column` =
+    // `value`, leaving out the row whose `idColumn` is `excludeId` (when not ""),
+    // and matching every extra `wheres` column.
+    interface PresenceVerifier {
+        fn count(table: string, column: string, value: any, excludeId: string, idColumn: string, wheres: HashMap<string, any>) -> long
+    }
+
+    // A built rule: a name the validator knows, its parameters, and what a
+    // string cannot carry (a condition, an ignored id, extra columns).
+    class RuleSpec {
+        public name: string
+        public params: Array<string>
+        public condition: fn() -> bool
+        public ignoreId: string = ""
+        public idColumn: string = "id"
+        public wheres: HashMap<string, any> = new HashMap<string, any>()
+        constructor(name: string, params: Array<string>) { self.name = name; self.params = params; self.condition = null; }
+        // unique: the row that may keep the value (the one being updated).
+        fn ignore(id: any, idColumn: string = "id") -> RuleSpec { self.ignoreId = id == null ? "" : str(id); self.idColumn = idColumn; return self; }
+        // unique/exists: only rows where `column` is `value` count.
+        fn where(column: string, value: any) -> RuleSpec { self.wheres.put(column, value); return self; }
+        fn toString() -> string { return self.params.size() == 0 ? self.name : self.name + ":" + Str.join(self.params, ","); }
+    }
+
+    // A closure as a rule.
+    class ClosureRule implements ValidationRule {
+        private f: fn(string, any, fn(string))
+        private runsWhenMissing: bool
+        constructor(f: fn(string, any, fn(string)), implicit: bool) { self.f = f; self.runsWhenMissing = implicit; }
+        fn validate(attribute: string, value: any, fail: fn(string)) { self.f(attribute, value, fail); }
+        fn implicit() -> bool { return self.runsWhenMissing; }
+    }
+
+    // A group of rules that applies only when a condition holds (Rule.when).
+    class ConditionalRules {
+        public condition: bool
+        public whenTrue: Array<any>
+        public whenFalse: Array<any>
+        constructor(condition: bool, whenTrue: Array<any>, whenFalse: Array<any>) { self.condition = condition; self.whenTrue = whenTrue; self.whenFalse = whenFalse; }
+    }
+
+    class Rule {
+        static fn in(values: Array<string>) -> RuleSpec { return new RuleSpec("in", values); }
+        static fn isIn(values: Array<string>) -> RuleSpec { return Rule.in(values); }
+        static fn notIn(values: Array<string>) -> RuleSpec { return new RuleSpec("not_in", values); }
+        // The value must not already be in `table`.`column` (column defaults to the field's name).
+        static fn unique(table: string, column: string = "") -> RuleSpec { return new RuleSpec("unique", [table, column]); }
+        // The value must be in `table`.`column`.
+        static fn exists(table: string, column: string = "") -> RuleSpec { return new RuleSpec("exists", [table, column]); }
+        static fn requiredIf(condition: fn() -> bool) -> RuleSpec { let r = new RuleSpec("required_if_fn", new Array<string>()); r.condition = condition; return r; }
+        static fn requiredIfValue(condition: bool) -> RuleSpec { return Rule.requiredIf(fn() -> bool { return condition; }); }
+        static fn prohibitedIf(condition: fn() -> bool) -> RuleSpec { let r = new RuleSpec("prohibited_if_fn", new Array<string>()); r.condition = condition; return r; }
+        static fn excludeIf(condition: fn() -> bool) -> RuleSpec { let r = new RuleSpec("exclude_if_fn", new Array<string>()); r.condition = condition; return r; }
+        // `rules` when `condition` holds, else `otherwise`.
+        static fn when(condition: bool, rules: Array<any>, otherwise: Array<any> = new Array<any>()) -> ConditionalRules { return new ConditionalRules(condition, rules, otherwise); }
+        // Passes when the value passes any one of `ruleSets` (each a rule string or list).
+        static fn anyOf(ruleSets: Array<any>) -> AnyOfRule { return new AnyOfRule(ruleSets); }
+        // An image's size: Rule.dimensions("min_width=100,max_height=800,ratio=16/9").
+        static fn dimensions(constraints: string) -> RuleSpec {
+            let a = new Array<string>();
+            for (p in Str.split(constraints, ",")) { a.push(Str.trim(p)); }
+            return new RuleSpec("dimensions", a);
+        }
+        // One of `values` exactly (an enum's names, say).
+        static fn oneOf(values: Array<string>) -> RuleSpec { return Rule.isIn(values); }
+        static fn regex(pattern: string) -> RuleSpec { let a = new Array<string>(); a.push(pattern); return new RuleSpec("regex", a); }
+        static fn dateFormat(format: string) -> RuleSpec { let a = new Array<string>(); a.push(format); return new RuleSpec("date_format", a); }
+        // A closure rule (implicit: it runs even for a missing field).
+        static fn check(f: fn(string, any, fn(string)), implicit: bool = false) -> ClosureRule { return new ClosureRule(f, implicit); }
+    }
+
+    // Password strength, built up: Password.min(12).letters().mixedCase().numbers().symbols().
+    class Password implements ValidationRule {
+        public minLength: int = 8
+        public maxLength: int = 0
+        public needLetters: bool = false
+        public needMixed: bool = false
+        public needNumbers: bool = false
+        public needSymbols: bool = false
+        static fn min(n: int) -> Password { let p = new Password(); p.minLength = n; return p; }
+        // What an application's default is (Password.defaults() is min 8).
+        static fn defaults() -> Password { return new Password(); }
+        fn max(n: int) -> Password { self.maxLength = n; return self; }
+        fn letters() -> Password { self.needLetters = true; return self; }
+        fn mixedCase() -> Password { self.needMixed = true; return self; }
+        fn numbers() -> Password { self.needNumbers = true; return self; }
+        fn symbols() -> Password { self.needSymbols = true; return self; }
+        fn validate(attribute: string, value: any, fail: fn(string)) {
+            if (!(value is string)) { fail(Messages.defaultFor("string", "string")); return; }
+            let s = value as string;
+            let n = Utf8.count(s);
+            if (n < self.minLength) { fail("The :attribute field must be at least ${self.minLength} characters."); }
+            if (self.maxLength > 0 && n > self.maxLength) { fail("The :attribute field must not be greater than ${self.maxLength} characters."); }
+            let lower = false;
+            let upper = false;
+            let digit = false;
+            let symbol = false;
+            for (i in 0..s.length) {
+                let c = s[i] as int;
+                if (c >= 97 && c <= 122) { lower = true; }
+                else if (c >= 65 && c <= 90) { upper = true; }
+                else if (c >= 48 && c <= 57) { digit = true; }
+                else if (c > 32) { symbol = true; }
+            }
+            if (self.needLetters && !lower && !upper) { fail(Messages.defaultFor("password.letters", "string")); }
+            if (self.needMixed && !(lower && upper)) { fail(Messages.defaultFor("password.mixed", "string")); }
+            if (self.needNumbers && !digit) { fail(Messages.defaultFor("password.numbers", "string")); }
+            if (self.needSymbols && !symbol) { fail(Messages.defaultFor("password.symbols", "string")); }
+        }
+        fn implicit() -> bool { return false; }
+    }
+
+    // An uploaded file's rules, built up: FileRule.image().maxKilobytes(2048).extensions(["jpg", "png"]).
+    class FileRule implements ValidationRule {
+        public allowed: Array<string> = new Array<string>()
+        public types: Array<string> = new Array<string>()
+        public maxKb: long = 0
+        public minKb: long = 0
+        static fn any() -> FileRule { return new FileRule(); }
+        static fn image() -> FileRule { let f = new FileRule(); for (e in ["jpg", "jpeg", "png", "gif", "bmp", "svg", "webp"]) { f.allowed.push(e); } return f; }
+        static fn types(extensions: Array<string>) -> FileRule { let f = new FileRule(); for (e in extensions) { f.allowed.push(Str.lower(e)); } return f; }
+        fn extensions(list: Array<string>) -> FileRule { self.allowed = new Array<string>(); for (e in list) { self.allowed.push(Str.lower(e)); } return self; }
+        fn mimeTypes(list: Array<string>) -> FileRule { for (t in list) { self.types.push(Str.lower(t)); } return self; }
+        fn maxKilobytes(kb: long) -> FileRule { self.maxKb = kb; return self; }
+        fn minKilobytes(kb: long) -> FileRule { self.minKb = kb; return self; }
+        fn validate(attribute: string, value: any, fail: fn(string)) {
+            if (!(value is UploadedFile)) { fail(Messages.defaultFor("file", "file")); return; }
+            let f = value as UploadedFile;
+            let ext = f.extension();
+            if (self.allowed.size() > 0 && !self.allowed.contains(ext) && !(ext == "jpeg" && self.allowed.contains("jpg")) && !(ext == "jpg" && self.allowed.contains("jpeg"))) {
+                fail(Str.replace(Messages.defaultFor("mimes", "file"), ":values", Str.join(self.allowed, ", ")));
+            }
+            if (self.types.size() > 0 && !Validator.mimeMatches(self.types, f.mimeType())) {
+                fail(Str.replace(Messages.defaultFor("mimetypes", "file"), ":values", Str.join(self.types, ", ")));
+            }
+            let kb = ((f.size() + 1023) / 1024) as long;
+            if (self.maxKb > 0 && kb > self.maxKb) { fail("The :attribute field must not be greater than ${self.maxKb} kilobytes."); }
+            if (self.minKb > 0 && kb < self.minKb) { fail("The :attribute field must be at least ${self.minKb} kilobytes."); }
+        }
+        fn implicit() -> bool { return false; }
+    }
+}
+
+namespace apogee {
+
+    // An image's width and height from its first bytes (PNG, GIF, JPEG, WebP,
+    // BMP): what dimensions rules check, with no image library.
+    class ImageSize {
+        // [width, height], or empty when the bytes are not a known image.
+        static fn of(b: Bytes) -> Array<int> {
+            let out = new Array<int>();
+            let n = b.size();
+            if (n >= 24 && b.get(0) == 137 && b.get(1) == 80 && b.get(2) == 78 && b.get(3) == 71) {         // PNG: IHDR
+                out.push(ImageSize.be32(b, 16)); out.push(ImageSize.be32(b, 20)); return out;
+            }
+            if (n >= 10 && b.get(0) == 71 && b.get(1) == 73 && b.get(2) == 70) {                             // GIF
+                out.push(b.get(6) | (b.get(7) << 8)); out.push(b.get(8) | (b.get(9) << 8)); return out;
+            }
+            if (n >= 26 && b.get(0) == 66 && b.get(1) == 77) {                                              // BMP
+                out.push(ImageSize.le32(b, 18)); let h = ImageSize.le32(b, 22); out.push(h < 0 ? -h : h); return out;
+            }
+            if (n >= 30 && b.get(0) == 82 && b.get(1) == 73 && b.get(8) == 87 && b.get(9) == 69) {           // RIFF....WEBP
+                let kind = b.get(15);
+                if (kind == 88 && n >= 30) {                                                                    // VP8X
+                    out.push(1 + (b.get(24) | (b.get(25) << 8) | (b.get(26) << 16))); out.push(1 + (b.get(27) | (b.get(28) << 8) | (b.get(29) << 16)));
+                } else if (kind == 76 && n >= 25) {                                                             // VP8L
+                    let bits = b.get(21) | (b.get(22) << 8) | (b.get(23) << 16) | (b.get(24) << 24);
+                    out.push((bits & 0x3FFF) + 1); out.push(((bits >> 14) & 0x3FFF) + 1);
+                } else if (n >= 30) {                                                                           // VP8
+                    out.push((b.get(26) | (b.get(27) << 8)) & 0x3FFF); out.push((b.get(28) | (b.get(29) << 8)) & 0x3FFF);
+                }
+                return out;
+            }
+            if (n >= 4 && b.get(0) == 255 && b.get(1) == 216) {                                              // JPEG: find a SOF marker
+                let i = 2;
+                while (i + 9 < n) {
+                    if (b.get(i) != 255) { i += 1; continue; }
+                    let marker = b.get(i + 1);
+                    if (marker >= 192 && marker <= 207 && marker != 196 && marker != 200 && marker != 204) {
+                        out.push((b.get(i + 7) << 8) | b.get(i + 8)); out.push((b.get(i + 5) << 8) | b.get(i + 6));
+                        return out;
+                    }
+                    let len = (b.get(i + 2) << 8) | b.get(i + 3);
+                    i += 2 + len;
+                }
+            }
+            return out;
+        }
+        private static fn be32(b: Bytes, i: int) -> int { return (b.get(i) << 24) | (b.get(i + 1) << 16) | (b.get(i + 2) << 8) | b.get(i + 3); }
+        private static fn le32(b: Bytes, i: int) -> int { return b.get(i) | (b.get(i + 1) << 8) | (b.get(i + 2) << 16) | (b.get(i + 3) << 24); }
+    }
+
+    // Passes when any one of several rule sets passes (Rule.anyOf).
+    class AnyOfRule implements ValidationRule, DataAwareRule {
+        private options: Array<any>
+        private data: HashMap<string, any>
+        constructor(options: Array<any>) { self.options = options; self.data = new HashMap<string, any>(); }
+        fn setData(data: HashMap<string, any>) { self.data = data; }
+        fn validate(attribute: string, value: any, fail: fn(string)) {
+            for (opt in self.options) {
+                let m = new HashMap<string, any>();
+                m.put("value", value);
+                let rules = new HashMap<string, any>();
+                rules.put("value", opt);
+                if (Validator.make(m, rules).passes()) { return; }
+            }
+            fail("The :attribute field is invalid.");
+        }
+        fn implicit() -> bool { return false; }
+    }
+}
