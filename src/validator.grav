@@ -86,6 +86,13 @@ namespace apogee {
         public static dontFlash: Array<string> = ["password", "password_confirmation", "current_password"]
         constructor(v: Validator) { super(ValidationException.summary(v.errors())); self.validator = v; }
         public fn kind() -> string { return "ValidationException"; }
+        // An error without rules: withMessages({"email": ["These credentials do not match our records."]}).
+        static fn withMessages(messages: HashMap<string, Array<string>>) -> ValidationException {
+            let v = Validator.make(new HashMap<string, any>(), new HashMap<string, any>());
+            v.errors();
+            for (field in messages.keys()) { for (m in messages[field]) { v.addError(field, m); } }
+            return new ValidationException(v);
+        }
         fn errors() -> MessageBag { return self.validator.errors(); }
         static fn summary(errors: MessageBag) -> string {
             let first = errors.first();

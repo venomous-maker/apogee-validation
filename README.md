@@ -125,6 +125,10 @@ with the errors flashed under their bag's name and the old input flashed,
 minus `password`, `password_confirmation` and `current_password`. That
 needs a session; without one it gets a 422 page listing the errors.
 
+To fail without rules (a sign-in that does not match, say), throw
+`ValidationException.withMessages({"email": ["These credentials do not match our records."]})`:
+it renders the same way.
+
 ## Tests
 
 ```bash

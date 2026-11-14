@@ -242,3 +242,8 @@ test "form requests: authorize, validate, prepare, after hooks, then the control
     let hooked = send("{\"title\": \"Forbidden\"}", "")
     assertEq(((hooked.data() as HashMap<string, any>)["errors"] as HashMap<string, any>).containsKey("title"), true)
 }
+
+test "ValidationException.withMessages: errors without rules" {
+    let e = ValidationException.withMessages({"email": ["These credentials do not match our records."]})
+    assertEq("${e.status} ${e.errors().first("email")}", "422 These credentials do not match our records.")
+}
