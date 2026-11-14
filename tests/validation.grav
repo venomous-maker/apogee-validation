@@ -5,7 +5,7 @@
 import "std"
 import "std/net"
 import "../src/all.grav"
-import "../../apogee-routing/src/all.grav"
+import "apogee-routing"
 use apogee.*
 
 fn check(data: HashMap<string, any>, rules: HashMap<string, any>) -> MessageBag { return Validator.make(data, rules).errors() }

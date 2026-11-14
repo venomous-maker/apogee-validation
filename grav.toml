@@ -3,5 +3,7 @@ lib = "src/all.grav"
 paths = ["src"]
 
 [dependencies]
-apogee-container = { path = "../apogee-container" }
-apogee-http = { path = "../apogee-http" }
+apogee-container = "github.com/venomous-maker/apogee-container"
+apogee-http = "github.com/venomous-maker/apogee-http"
+# (the tests run form requests through the router)
+apogee-routing = "github.com/venomous-maker/apogee-routing"
