@@ -90,7 +90,7 @@ namespace apogee {
         static fn withMessages(messages: HashMap<string, Array<string>>) -> ValidationException {
             let v = Validator.make(new HashMap<string, any>(), new HashMap<string, any>());
             v.errors();
-            for (field in messages.keys()) { for (m in messages[field]) { v.addError(field, m); } }
+            for ((field, list) in messages) { for (m in list) { v.addError(field, m); } }
             return new ValidationException(v);
         }
         fn errors() -> MessageBag { return self.validator.errors(); }
@@ -803,7 +803,7 @@ namespace apogee {
         // The field's display name: a custom attribute (by field or by pattern), else words.
         fn attributeName(field: string) -> string {
             if (self.names.containsKey(field)) { return self.names[field]; }
-            for (k in self.names.keys()) { if (Str.contains(k, "*") && MessageBag.matches(k, field)) { return self.names[k]; } }
+            for ((k, name) in self.names) { if (Str.contains(k, "*") && MessageBag.matches(k, field)) { return name; } }
             return Messages.humanize(field);
         }
         private fn messageFor(pattern: string, field: string, r: ParsedRule, kind: string) -> string {
@@ -811,8 +811,8 @@ namespace apogee {
             let keyed = [field + "." + r.name, pattern + "." + r.name];
             for (k in keyed) { if (template == "" && self.custom.containsKey(k)) { template = self.custom[k]; } }
             if (template == "") {
-                for (k in self.custom.keys()) {
-                    if (Str.contains(k, "*") && Str.endsWith(k, "." + r.name) && MessageBag.matches(k[..k.length - r.name.length - 1], field)) { template = self.custom[k]; }
+                for ((k, text) in self.custom) {
+                    if (Str.contains(k, "*") && Str.endsWith(k, "." + r.name) && MessageBag.matches(k[..k.length - r.name.length - 1], field)) { template = text; }
                 }
             }
             if (template == "" && self.custom.containsKey(r.name)) { template = self.custom[r.name]; }
