@@ -5,6 +5,6 @@ paths = ["src"]
 
 [dependencies]
 apogee-container = "github.com/venomous-maker/apogee-container@v0.2.0"
-apogee-http = "github.com/venomous-maker/apogee-http@v0.2.0"
+apogee-http = "github.com/venomous-maker/apogee-http@v0.3.0"
 # (the tests run form requests through the router)
-apogee-routing = "github.com/venomous-maker/apogee-routing@v0.2.0"
+apogee-routing = "github.com/venomous-maker/apogee-routing@v0.3.0"
