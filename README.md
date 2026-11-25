@@ -6,7 +6,7 @@ rules, rule objects and closures, the database's `unique`/`exists`, files
 and image dimensions, errors that render themselves, `req.validate()`, and
 form requests that authorize and validate before a controller runs.
 
-```grav
+```typescript
 import "std"
 import "apogee-validation"
 
@@ -23,7 +23,7 @@ let data = req.validate({
 
 ## Form requests
 
-```grav
+```typescript
 class StorePostRequest extends FormRequest {
     fn authorize() -> bool { return self.user != null }
     fn rules() -> HashMap<string, any> {
